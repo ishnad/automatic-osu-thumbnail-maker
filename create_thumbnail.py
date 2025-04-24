@@ -232,19 +232,55 @@ def create_thumbnail(score_id, client_id, client_secret):
         
         thumbnail.save("bgBeatmap.jpg") # for debugging
 
-        # Load font (adjust path as needed)
+        # Add player avatar
+        avatar_url = score_data["user"]["avatar_url"]
         try:
-            font_large = ImageFont.truetype("arialbd.ttf", 72)
-            font_medium = ImageFont.truetype("arial.ttf", 48)
-        except:
-            # Fallback to default font if arial not available
+            response = requests.get(avatar_url, timeout=10)
+            response.raise_for_status()
+            avatar_img = Image.open(BytesIO(response.content))
+            # Resize avatar to 150x150
+            avatar_img = avatar_img.resize((150, 150))
+            # Create circular mask
+            mask = Image.new("L", (150, 150), 0)
+            draw_mask = ImageDraw.Draw(mask)
+            draw_mask.ellipse((0, 0, 150, 150), fill=255)
+            # Paste avatar with mask at bottom left
+            thumbnail.paste(avatar_img, (50, 930), mask)
+        except Exception as e:
+            print(f"Couldn't load player avatar: {e}")
+
+        # Load font (adjust path as needed)
+        # Try Symbola font first, then other Unicode fonts
+        font_paths = [
+            "symbola/Symbola.ttf",  # User-provided Unicode font
+            "arialuni.ttf",         # Windows Unicode font
+            "seguiemj.ttf",         # Windows emoji font
+            "arialbd.ttf",          # Fallback 1
+            "arial.ttf"             # Fallback 2
+        ]
+        
+        font_large = None
+        font_medium = None
+        
+        for path in font_paths:
+            try:
+                if not font_large:
+                    font_large = ImageFont.truetype(path, 72)
+                if not font_medium:
+                    font_medium = ImageFont.truetype(path, 48)
+            except:
+                continue
+                
+        if not font_large or not font_medium:
+            # Ultimate fallback - use default font and replace star with asterisk
             font_large = ImageFont.load_default()
             font_medium = ImageFont.load_default()
         
         # Add song info at top right
         song_title = beatmapset_data["title"]
         difficulty = beatmap_data["version"]
-        stars = beatmap_data["difficulty_rating"]
+        # Use adjusted star rating if mods are applied
+        stars = beatmap_data.get("difficulty", {}).get("total", beatmap_data["difficulty_rating"])
         
         # Add semi-transparent background for text (expanded)
         draw.rectangle([(50, 50), (500, 350)], fill=(0, 0, 0, 128))
@@ -258,7 +294,13 @@ def create_thumbnail(score_id, client_id, client_secret):
         
         # Add song info
         draw.text((1210, 60), f"{song_title}", font=font_medium, fill=(255, 255, 255))
-        draw.text((1210, 110), f"{difficulty} ★{stars:.2f}", font=font_medium, fill=(255, 255, 255))
+        # Render difficulty name and star rating separately to ensure star symbol displays
+        draw.text((1210, 110), f"{difficulty} ", font=font_medium, fill=(255, 255, 255))
+        # Use a simple asterisk if star symbol isn't available
+        try:
+            draw.text((1210 + font_medium.getlength(f"{difficulty} "), 110), f"★{stars:.2f}", font=font_medium, fill=(255, 255, 255))
+        except:
+            draw.text((1210 + font_medium.getlength(f"{difficulty} "), 110), f"*{stars:.2f}", font=font_medium, fill=(255, 255, 255))
         
         # Save the result
         thumbnail.save("thumbnail.jpg")
