@@ -7,6 +7,7 @@ import os
 from dotenv import load_dotenv
 import base64
 import json
+import re
 
 # OAuth2 authentication
 def get_access_token(client_id, client_secret):
@@ -53,7 +54,6 @@ def download_from_mirror(beatmapset_id):
     extract_folder = f"./temp_beatmap_{beatmapset_id}"
     try:
         print(f"Attempting to download beatmapset {beatmapset_id} from mirror...")
-        # Use requests with Beatconnect API
         response = requests.get(f"https://beatconnect.io/b/{beatmapset_id}/", stream=True)
         response.raise_for_status()
         
@@ -69,7 +69,6 @@ def download_from_mirror(beatmapset_id):
                 zip_ref.extractall(extract_folder)
             print(f"Extracted to {extract_folder}")
         finally:
-            # Clean up the downloaded .osz file
             if os.path.exists(osz_path):
                 os.remove(osz_path)
 
@@ -105,9 +104,6 @@ def download_from_mirror(beatmapset_id):
             image_path = os.path.join(extract_folder, bg_filename)
             if os.path.exists(image_path):
                 bg_image = Image.open(image_path)
-                
-                # Make a copy of the image data and close the original
-                from io import BytesIO
                 img_bytes = BytesIO()
                 bg_image.save(img_bytes, format=bg_image.format)
                 bg_image.close()
@@ -117,7 +113,6 @@ def download_from_mirror(beatmapset_id):
     except Exception as e:
         print(f"Mirror download failed: {e}")
     finally:
-        # Clean up extracted folder if it exists
         if os.path.exists(extract_folder):
             import time
             import shutil
@@ -131,132 +126,130 @@ def download_from_mirror(beatmapset_id):
                     if i == max_retries - 1:
                         print(f"Failed to clean up temporary folder after {max_retries} attempts: {e}")
                     else:
-                        time.sleep(0.5)  # Wait before retrying
+                        time.sleep(0.5)
     return bg_image
 
-def create_thumbnail(score_id, client_id, client_secret):
-    # 1. Authenticate
-    token = get_access_token(client_id, client_secret)
-    
+def extract_ordr_code(ordr_url: str) -> str:
+    """Pulls the 6- or 7-character code from URLs like https://link.issou.best/Q6w6UU"""
+    m = re.search(r"(?:best/)(\w+)", ordr_url)
+    if not m:
+        raise ValueError(f"Invalid ORDR URL: {ordr_url}")
+    return m.group(1)
+
+def fetch_ordr_metadata(link_code: str) -> dict:
+    """GET https://apis.issou.best/ordr/renders?link=<code>"""
+    resp = requests.get(
+        "https://apis.issou.best/ordr/renders",
+        params={"link": link_code}
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("renders"):
+        raise RuntimeError("No render data found for code " + link_code)
+    return data["renders"][0]
+
+def create_thumbnail(ordr_url, client_id=None, client_secret=None):
+    """Create osu! thumbnail from ORDR render link."""
     try:
-        # 3. Fetch score data with debug logging
-        score_data = make_api_request(token, f"scores/{score_id}")
-        # print("DEBUG - API Response score_data:", json.dumps(score_data, indent=2))
+        if not ordr_url:
+            raise ValueError("ORDR URL is required")
         
-        # 4. Extract required information from direct response
-        try:
-            mods = score_data.get("mods", [])
-            mods_str = "+".join(mods) if mods else "NM"
-            
-            pp = score_data.get("pp", 0)
-            accuracy = score_data.get("accuracy", 0) * 100
-            accuracy_str = f"{accuracy:.2f}%"
+        print("Generating thumbnail from ORDR URL")
+        code = extract_ordr_code(ordr_url)
+        meta = fetch_ordr_metadata(code)
 
-            username = score_data["user"]["username"]
-            
-            # Get background image - try mirror first, then fallback to API
-            beatmap_id = score_data["beatmap"]["id"]
-            beatmap_data = make_api_request(token, f"beatmaps/{beatmap_id}")
-            beatmapset_id = beatmap_data["beatmapset_id"]
-            
-            # Try to get background from mirror download first
-            bg_image = download_from_mirror(beatmapset_id)
-            if bg_image:
-                print("Using background from mirror download")
-            else:
-                print("Falling back to official API cover image")
-                
-        except (KeyError, TypeError) as e:
-            print(f"Error parsing API response: {str(e)}")
-            print("Please check if the score ID is valid and the API response format")
-            return
-        beatmapset_data = make_api_request(token, f"beatmapsets/{beatmapset_id}")
-        # print("DEBUG - API Response beatmap_data:", json.dumps(beatmap_data, indent=2))
-        #print("DEBUG - API Response beatmapset_data:", json.dumps(beatmapset_data, indent=2))
+        # Extract fields from metadata
+        username = meta["replayUsername"]
+        song_title = meta["mapTitle"] 
+        difficulty = meta["replayDifficulty"]
 
-        # Only fetch from API if we didn't get image from mirror
-        if not bg_image:
-            # --- Revised Background Image Fetching ---
-            covers = None
-            if "beatmapset" in beatmap_data and isinstance(beatmap_data.get("beatmapset"), dict) and "covers" in beatmap_data["beatmapset"]:
-                covers = beatmap_data["beatmapset"]["covers"]
-                print("DEBUG: Found covers object in beatmap_data.beatmapset")
-            elif "covers" in beatmapset_data:
-                covers = beatmapset_data["covers"]
-                print("DEBUG: Found covers object in beatmapset_data")
-            else:
-                print("Error: Could not find 'covers' object in API responses.")
-                return
+        # Parse accuracy & stars
+        desc = meta["description"]
+        acc_match = re.search(r"Accuracy:\s*([\d.]+)%", desc)
+        accuracy = float(acc_match.group(1)) if acc_match else 0.0
+        accuracy_str = f"{accuracy:.2f}%"
+        
+        star_match = re.search(r"\(([\d.]+) ⭐\)", desc)
+        stars = float(star_match.group(1)) if star_match else 0.0
 
-            bg_url = None
-            if covers:
-                bg_url = covers.get("raw") or covers.get("cover@2x") or covers.get("cover")
-            
-            if not bg_url or not isinstance(bg_url, str):
-                raise ValueError(f"Failed to retrieve valid background URL from API. Covers: {covers}")
+        beatmapset_id = meta["mapID"]
+        token = None
+        beatmapset_data = None
+        user_data = None
 
+        # Fetch API data if credentials provided
+        if client_id and client_secret:
             try:
-                print(f"DEBUG: Attempting to download image from: {bg_url}")
-                response = requests.get(bg_url, timeout=15)
+                token = get_access_token(client_id, client_secret)
+                # Fetch beatmapset details (needed for difficulty ID and potentially background)
+                beatmapset_data = make_api_request(token, f"beatmapsets/{beatmapset_id}")
+                # Fetch user details (needed for user ID and avatar)
+                user_data = make_api_request(token, f"users/{username}/osu")
+            except Exception as e:
+                print(f"Failed to fetch initial API data: {e}")
+                # Continue without API data if possible, features like PP/Avatar might fail
+
+        # Get background image: Try mirror first, then API
+        bg_image = download_from_mirror(beatmapset_id)
+        
+        if not bg_image and beatmapset_data: # Use fetched beatmapset_data if available
+            covers = beatmapset_data.get("covers", {})
+            bg_url = covers.get("cover@2x") or covers.get("cover")
+            if bg_url:
+                print("Using background from osu! API")
+                response = requests.get(bg_url)
                 response.raise_for_status()
                 bg_image = Image.open(BytesIO(response.content))
-            except requests.exceptions.RequestException as e:
-                print(f"Error downloading background image: {e}")
-                return
-            except Exception as e:
-                print(f"Error processing background image: {e}")
-                return
-        
-        # Create thumbnail with black bars to maintain aspect ratio
+
+        if not bg_image:
+            raise ValueError("Could not obtain background image")
+
+        # Create thumbnail
         bg_width, bg_height = bg_image.size
         target_width, target_height = 1920, 1080
         
-        # Calculate scaling factor
-        width_ratio = target_width / bg_width
-        height_ratio = target_height / bg_height
-        scale = min(width_ratio, height_ratio)
-        
-        # Resize image proportionally
+        # Calculate scaling
+        scale = min(target_width/bg_width, target_height/bg_height)
         new_width = int(bg_width * scale)
         new_height = int(bg_height * scale)
         resized = bg_image.resize((new_width, new_height), Image.LANCZOS)
         
-        # Create blank thumbnail with black background
+        # Create blank thumbnail
         thumbnail = Image.new("RGB", (target_width, target_height), (0, 0, 0))
-        
-        # Paste resized image centered
         x_offset = (target_width - new_width) // 2
         y_offset = (target_height - new_height) // 2
         thumbnail.paste(resized, (x_offset, y_offset))
         draw = ImageDraw.Draw(thumbnail)
-        
-        thumbnail.save("bgBeatmap.jpg") # for debugging
 
-        # Add player avatar
-        avatar_url = score_data["user"]["avatar_url"]
+        # Add player avatar using fetched user_data
         try:
+            avatar_url = None
+            if user_data: # Use data from API if available
+                 avatar_url = user_data.get("avatar_url")
+            
+            if not avatar_url: # Fallback if no API data or URL missing
+                 # Fallback if no API credentials or user fetch failed
+                 avatar_url = f"https://a.ppy.sh/{username}" # Might not work for numeric usernames
+                 print("Using fallback avatar URL")
+
             response = requests.get(avatar_url, timeout=10)
             response.raise_for_status()
-            avatar_img = Image.open(BytesIO(response.content))
-            # Resize avatar to 150x150
+            avatar_img = Image.open(BytesIO(response.content)).convert("RGB")
             avatar_img = avatar_img.resize((150, 150))
-            # Create circular mask
             mask = Image.new("L", (150, 150), 0)
             draw_mask = ImageDraw.Draw(mask)
             draw_mask.ellipse((0, 0, 150, 150), fill=255)
-            # Paste avatar with mask at bottom left
             thumbnail.paste(avatar_img, (50, 930), mask)
         except Exception as e:
             print(f"Couldn't load player avatar: {e}")
 
-        # Load font (adjust path as needed)
-        # Try Symbola font first, then other Unicode fonts
+        # Add text elements
         font_paths = [
-            "symbola/Symbola.ttf",  # User-provided Unicode font
-            "arialuni.ttf",         # Windows Unicode font
-            "seguiemj.ttf",         # Windows emoji font
-            "arialbd.ttf",          # Fallback 1
-            "arial.ttf"             # Fallback 2
+            "symbola/Symbola.ttf",
+            "arialuni.ttf",
+            "seguiemj.ttf", 
+            "arialbd.ttf",
+            "arial.ttf"
         ]
         
         font_large = None
@@ -270,43 +263,91 @@ def create_thumbnail(score_id, client_id, client_secret):
                     font_medium = ImageFont.truetype(path, 48)
             except:
                 continue
+
+        # Default values for fields not provided by ORDR or API
+        mods_str = "NM" # ORDR doesn't provide mods directly yet
+        pp = 0.0
+
+        # Fetch PP if possible using user_id and correct beatmap_id
+        if token and user_data and beatmapset_data: # Check if we have API token and necessary data
+            try:
+                user_id = user_data['id']
+                target_difficulty_name = meta['replayDifficulty']
+                beatmap_id = None
+
+                # Find the beatmap ID for the specific difficulty
+                for beatmap in beatmapset_data.get('beatmaps', []):
+                    if beatmap.get('version') == target_difficulty_name:
+                        beatmap_id = beatmap.get('id')
+                        print(f"Found matching beatmap ID: {beatmap_id} for difficulty '{target_difficulty_name}'")
+                        break
                 
-        if not font_large or not font_medium:
-            # Ultimate fallback - use default font and replace star with asterisk
-            font_large = ImageFont.load_default()
-            font_medium = ImageFont.load_default()
-        
-        # Add song info at top right
-        song_title = beatmapset_data["title"]
-        difficulty = beatmap_data["version"]
-        # Use adjusted star rating if mods are applied
-        stars = beatmap_data.get("difficulty", {}).get("total", beatmap_data["difficulty_rating"])
-        
-        # Add semi-transparent background for text (expanded)
-        draw.rectangle([(50, 50), (500, 350)], fill=(0, 0, 0, 128))
-        draw.rectangle([(1200, 50), (1870, 150)], fill=(0, 0, 0, 128))
-        
-        # Add text elements
+                if beatmap_id:
+                    # Make API call with the correct beatmap difficulty ID
+                    score_data = make_api_request(token, f"beatmaps/{beatmap_id}/scores/users/{user_id}")
+                    score_info = score_data.get("score")
+                    if score_info:
+                        pp = score_info.get("pp", 0.0)
+                        # Extract mods from the actual score if available (inside if score_info)
+                        mods_list = score_info.get("mods", [])
+                        if mods_list:
+                             mods_str = "".join(mods_list)
+                        else:
+                             mods_str = "NM" # Keep NM if mods list is empty
+                    else: # This else corresponds to 'if score_info:'
+                        # Handle case where the specific score wasn't found for this difficulty
+                        print(f"Score not found for user {user_id} on beatmap {beatmap_id}. PP set to 0.")
+                        pp = 0.0
+                        # mods_str remains the default "NM"
+                    
+                    if pp is None: # API might return null PP for some scores (e.g. loved maps)
+                        pp = 0.0
+                    print(f"Fetched PP: {pp}, Mods: {mods_str}")
+                
+                else: # This else corresponds to 'if beatmap_id:'
+                    print(f"Could not find beatmap ID for difficulty '{target_difficulty_name}' in beatmapset {beatmapset_id}.")
+
+            except Exception as e:
+                # Print exception details, including potential API errors
+                print(f"Could not fetch PP/Score details: {e}")
+                # Keep default pp = 0.0
+
+        # Add text
         draw.text((60, 60), f"Player: {username}", font=font_medium, fill=(255, 255, 255))
         draw.text((60, 120), f"PP: {pp:.0f}", font=font_large, fill=(255, 255, 255))
         draw.text((60, 200), f"Accuracy: {accuracy_str}", font=font_medium, fill=(255, 255, 255))
-        draw.text((60, 260), f"Mods: {mods_str}", font=font_medium, fill=(255, 255, 255))
+        draw.text((60, 260), f"Mods: {mods_str}", font=font_medium, fill=(255, 255, 255)) # Using default NM for now
+        # Adjust text position slightly if needed, ensure it fits
+        # Example: Truncate long titles/difficulties if necessary
+        max_text_width = target_width - 1210 - 60 # Max width for right-side text
         
-        # Add song info
-        draw.text((1210, 60), f"{song_title}", font=font_medium, fill=(255, 255, 255))
-        # Render difficulty name and star rating separately to ensure star symbol displays
-        draw.text((1210, 110), f"{difficulty} ", font=font_medium, fill=(255, 255, 255))
-        # Use a simple asterisk if star symbol isn't available
-        try:
-            draw.text((1210 + font_medium.getlength(f"{difficulty} "), 110), f"★{stars:.2f}", font=font_medium, fill=(255, 255, 255))
-        except:
-            draw.text((1210 + font_medium.getlength(f"{difficulty} "), 110), f"*{stars:.2f}", font=font_medium, fill=(255, 255, 255))
+        # Simple truncation example (can be improved with text wrapping or shrinking)
+        available_width = target_width - 1210 - 60 
         
-        # Save the result
+        def truncate_text(text, font, max_width):
+            if font.getlength(text) <= max_width:
+                return text
+            else:
+                truncated = ""
+                for char in text:
+                    if font.getlength(truncated + char + "...") <= max_width:
+                        truncated += char
+                    else:
+                        break
+                return truncated + "..."
+
+        truncated_title = truncate_text(song_title, font_medium, available_width)
+        truncated_diff = truncate_text(f"{difficulty} ★{stars:.2f}", font_medium, available_width)
+
+        draw.text((1210, 60), truncated_title, font=font_medium, fill=(255, 255, 255))
+        draw.text((1210, 110), truncated_diff, font=font_medium, fill=(255, 255, 255))
+        
+        # Save result
         thumbnail.save("thumbnail.jpg")
         
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Thumbnail generation failed: {e}")
+        raise
 
 # Load credentials from .env.local
 load_dotenv(dotenv_path=".env.local")
@@ -315,5 +356,8 @@ client_secret = os.getenv("CLIENT_SECRET")
 
 # Example usage
 if __name__ == "__main__":
-    score_id = "4703632894"
-    create_thumbnail(score_id, client_id, client_secret)
+    create_thumbnail(
+        ordr_url="https://link.issou.best/Q6w6UU",
+        client_id=client_id,
+        client_secret=client_secret
+    )
