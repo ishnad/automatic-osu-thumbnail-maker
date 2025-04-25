@@ -8,6 +8,11 @@ from dotenv import load_dotenv
 import base64
 import json
 import re
+import winreg
+import ctypes
+import time
+import shutil
+import sys
 
 # OAuth2 authentication
 def get_access_token(client_id, client_secret):
@@ -114,8 +119,6 @@ def download_from_mirror(beatmapset_id):
         print(f"Mirror download failed: {e}")
     finally:
         if os.path.exists(extract_folder):
-            import time
-            import shutil
             max_retries = 3
             for i in range(max_retries):
                 try:
@@ -349,15 +352,107 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
         print(f"Thumbnail generation failed: {e}")
         raise
 
-# Load credentials from .env.local
-load_dotenv(dotenv_path=".env.local")
-client_id = os.getenv("CLIENT_ID")
-client_secret = os.getenv("CLIENT_SECRET")
+def verify_credentials(client_id, client_secret):
+    """Verify if credentials are valid by attempting to get an access token"""
+    try:
+        token = get_access_token(client_id, client_secret)
+        return True
+    except Exception as e:
+        print(f"Credential verification failed: {e}")
+        return False
 
-# Example usage
+def save_credentials_to_env(client_id, client_secret):
+    """Save credentials to Windows user environment variables"""
+    try:
+        # Open the environment key in registry
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            "Environment",
+            0,
+            winreg.KEY_SET_VALUE
+        )
+        
+        # Set the values
+        winreg.SetValueEx(key, "OSU_CLIENT_ID_THUMBNAIL", 0, winreg.REG_SZ, client_id)
+        winreg.SetValueEx(key, "OSU_CLIENT_SECRET_THUMBNAIL", 0, winreg.REG_SZ, client_secret)
+        
+        # Close the key
+        winreg.CloseKey(key)
+        
+        # Update current process environment
+        os.environ["OSU_CLIENT_ID_THUMBNAIL"] = client_id
+        os.environ["OSU_CLIENT_SECRET_THUMBNAIL"] = client_secret
+        
+        # Broadcast WM_SETTINGCHANGE to notify other processes
+        ctypes.windll.user32.SendMessageTimeoutW(
+            0xFFFF,  # HWND_BROADCAST
+            0x1A,    # WM_SETTINGCHANGE
+            0,
+            "Environment",
+            0x02,    # SMTO_ABORTIFHUNG
+            5000,    # timeout in ms
+            None
+        )
+        return True
+    except Exception as e:
+        print(f"Failed to save credentials to environment: {e}")
+        return False
+
+def get_input(prompt):
+    """Cross-platform input function that works with compiled executables"""
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        # For compiled executables that don't properly handle input()
+        print(prompt, end='', flush=True)
+        return sys.stdin.readline().strip()
+
+def main():
+    # Try to load existing credentials
+    client_id = os.getenv("OSU_CLIENT_ID_THUMBNAIL")
+    client_secret = os.getenv("OSU_CLIENT_SECRET_THUMBNAIL")
+    
+    # If not found, prompt user
+    if not client_id or not client_secret:
+        print("Please enter your osu! API credentials:")
+        client_id = get_input("Client ID: ")
+        client_secret = get_input("Client Secret: ")
+        
+        if not client_id or not client_secret:
+            print("Error: Both Client ID and Secret are required")
+            get_input("Press Enter to exit...")
+            return
+            
+        # Verify credentials
+        if verify_credentials(client_id, client_secret):
+            if save_credentials_to_env(client_id, client_secret):
+                print("Credentials verified and saved to system environment!")
+            else:
+                print("Credentials verified but failed to save to environment.")
+                print("The application will continue but you'll need to enter credentials next time.")
+        else:
+            print("Invalid credentials. Please try again.")
+            get_input("Press Enter to exit...")
+            return
+    
+    # Get ORDR URL
+    ordr_url = get_input("Enter ORDR URL: ")
+    if not ordr_url:
+        print("ORDR URL is required")
+        get_input("Press Enter to exit...")
+        return
+    
+    try:
+        create_thumbnail(
+            ordr_url=ordr_url,
+            client_id=client_id,
+            client_secret=client_secret
+        )
+        print("Thumbnail created successfully!")
+    except Exception as e:
+        print(f"Error creating thumbnail: {e}")
+    finally:
+        get_input("Press Enter to exit...")
+
 if __name__ == "__main__":
-    create_thumbnail(
-        ordr_url="https://link.issou.best/Q6w6UU",
-        client_id=client_id,
-        client_secret=client_secret
-    )
+    main()

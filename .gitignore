@@ -173,6 +173,14 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# Nuitka artifacts
+*.build/
+*.dist/
+*.onefile-build/
+*.exe
+*.pyd
+*.dll
+
 .env.local
 thumbnail.jpg
 replay1.osr
