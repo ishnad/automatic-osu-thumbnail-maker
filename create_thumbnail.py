@@ -20,6 +20,14 @@ from PyQt5.QtGui import QTextCursor
 import logging
 from enum import IntFlag
 import math # Import math for glow effect calculation
+from typing import Union, Tuple, Optional # Import Union, Tuple, Optional
+
+try:
+    import rosu_pp_py
+    ROSU_PP_AVAILABLE = True
+except ImportError:
+    ROSU_PP_AVAILABLE = False
+    # Log this issue later once logger is fully configured
 
 # --- Setup logging early ---
 LOG_FILENAME = 'thumbnail_generator.log' # Define log filename constant
@@ -30,6 +38,11 @@ log_file_handler.setFormatter(log_formatter)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG) # Set logger level
 logger.addHandler(log_file_handler)
+
+# Log rosu-pp status after logger setup
+if not ROSU_PP_AVAILABLE:
+    logger.warning("rosu-pp-py library not found. PP calculation for FC check will be skipped. Please install it using 'pip install rosu-pp-py'")
+
 
 # --- Custom Log Handler for PyQt GUI ---
 class QtLogHandler(logging.Handler, QObject):
@@ -243,6 +256,7 @@ def get_mods_enum_from_list(mod_list: list[str]) -> int:
 
     return int(final_enum)
 
+# --- REMOVED map_mods_to_rosu function ---
 
 # OAuth2 authentication
 def get_access_token(client_id, client_secret):
@@ -313,10 +327,18 @@ def make_api_request(token, endpoint, method='GET', payload=None):
         raise Exception(f"Unexpected error during API request for {method} {endpoint}: {e}")
 
 
-def download_from_mirror(beatmapset_id):
-    """Attempt to download beatmap from mirror API and extract background image"""
+# download_from_mirror
+def download_from_mirror(beatmapset_id: int, target_difficulty_name: str) -> Tuple[Optional[Image.Image], Optional[str]]:
+    """
+    Attempt to download beatmap from mirror API, extract background image,
+    and find the content of the .osu file matching target_difficulty_name.
+    Returns a tuple: (PIL.Image or None, osu_file_content_string or None)
+    """
     extract_folder = f"./temp_beatmap_{beatmapset_id}"
     bg_image = None
+    osu_file_content = None
+    osu_file_path_found = None # Store the path to the target .osu file
+
     try:
         logger.info(f"Attempting to download beatmapset {beatmapset_id} from mirror...")
         # Add timeout to mirror request
@@ -339,64 +361,98 @@ def download_from_mirror(beatmapset_id):
                 os.remove(osz_path)
                 logger.info(f"Removed temporary file: {osz_path}")
 
-        # Find and parse .osu file
+        # --- Find target .osu file and background filename ---
         bg_filename = None
+        target_osu_found = False
+        normalized_target_diff = target_difficulty_name.strip().lower() if target_difficulty_name else None
+
+        # Iterate through extracted files to find the correct .osu file first
         for filename in os.listdir(extract_folder):
             if filename.endswith(".osu"):
                 osu_file_path = os.path.join(extract_folder, filename)
-                logger.info(f"Parsing .osu file: {osu_file_path}")
+                logger.debug(f"Checking .osu file: {osu_file_path}")
                 try:
-                    # Simplified parsing: just look for the background line
                     with open(osu_file_path, 'r', encoding='utf-8') as f:
-                        in_events_section = False
-                        for line in f:
-                            line = line.strip()
-                            if not in_events_section:
-                                if line == "[Events]":
-                                    in_events_section = True
-                                continue
-                            else: # Inside [Events]
-                                if line.startswith("//") or not line:
+                        file_content_lines = f.readlines() # Read all lines for parsing
+
+                    # Parse Version (difficulty name)
+                    current_diff_name = None
+                    for line in file_content_lines:
+                        line = line.strip()
+                        if line.startswith("Version:"):
+                            current_diff_name = line.split(":", 1)[1].strip()
+                            break # Found version
+
+                    if current_diff_name:
+                        normalized_current_diff = current_diff_name.strip().lower()
+                        logger.debug(f"Found difficulty '{current_diff_name}' (Normalized: '{normalized_current_diff}') in {filename}")
+
+                        # Check if this is the target difficulty
+                        if not target_osu_found and normalized_target_diff and normalized_current_diff == normalized_target_diff:
+                            logger.info(f"Found matching .osu file for difficulty '{target_difficulty_name}': {osu_file_path}")
+                            osu_file_path_found = osu_file_path
+                            osu_file_content = "".join(file_content_lines) # Store the content
+                            target_osu_found = True
+                            # Continue parsing this file for background info
+
+                        # Parse background filename from the *current* file (might be the target or another diff)
+                        # Only update bg_filename if we haven't found one yet or if this is the target file
+                        if bg_filename is None or osu_file_path == osu_file_path_found:
+                            in_events_section = False
+                            temp_bg_filename = None
+                            for line in file_content_lines:
+                                line = line.strip()
+                                if not in_events_section:
+                                    if line == "[Events]":
+                                        in_events_section = True
                                     continue
-                                # Stop if we hit the next section
-                                if line.startswith("["):
-                                    break
-                                # Look for background definition: 0,0,"bg.jpg",0,0 or Background,,0,"bg.jpg"
-                                parts = line.split(',')
-                                if len(parts) >= 3 and (parts[0] == '0' or parts[0].lower() == 'background') and parts[1] == '0':
-                                    bg_filename = parts[2].strip('"')
-                                    logger.info(f"Found background filename in .osu: {bg_filename}")
-                                    break # Found the background
-                                elif len(parts) >= 4 and parts[0].lower() == 'background' and parts[2] == '0': # Alternative format
-                                    bg_filename = parts[3].strip('"')
-                                    logger.info(f"Found background filename (alt format) in .osu: {bg_filename}")
-                                    break # Found the background
-                        if bg_filename: # Stop searching other .osu files if found
-                            break
+                                else: # Inside [Events]
+                                    if line.startswith("//") or not line:
+                                        continue
+                                    if line.startswith("["): # Stop if we hit the next section
+                                        break
+                                    # Look for background definition
+                                    parts = line.split(',')
+                                    if len(parts) >= 3 and (parts[0] == '0' or parts[0].lower() == 'background') and parts[1] == '0':
+                                        temp_bg_filename = parts[2].strip('"')
+                                        break
+                                    elif len(parts) >= 4 and parts[0].lower() == 'background' and parts[2] == '0': # Alt format
+                                        temp_bg_filename = parts[3].strip('"')
+                                        break
+                            if temp_bg_filename:
+                                if osu_file_path == osu_file_path_found:
+                                    logger.info(f"Found background filename in target .osu: {temp_bg_filename}")
+                                    bg_filename = temp_bg_filename # Prioritize BG from target diff
+                                elif bg_filename is None:
+                                    logger.info(f"Found background filename in non-target .osu ({filename}): {temp_bg_filename} (using as fallback)")
+                                    bg_filename = temp_bg_filename
+
+                    else:
+                        logger.warning(f"Could not parse 'Version:' from {filename}")
+
                 except Exception as e:
                     logger.error(f"Error parsing .osu file {osu_file_path}: {e}")
                     continue # Try next .osu file
 
-        # Load the background image if found
+        if not target_osu_found:
+            logger.warning(f"Could not find .osu file matching target difficulty '{target_difficulty_name}' in the archive.")
+            # osu_file_content remains None
+
+        # --- Load the background image if filename was found ---
         if bg_filename:
-            # Sometimes the filename in .osu might have incorrect casing or path separators
-            # Try to find the actual file case-insensitively
             actual_bg_filename = None
             for item in os.listdir(extract_folder):
-                # Handle potential subdirectories like 'BG/' often used
                 item_path = os.path.join(extract_folder, item)
                 if os.path.isfile(item_path) and item.lower() == bg_filename.lower():
                     actual_bg_filename = item
                     break
                 elif os.path.isdir(item_path):
-                    # Check one level deeper for common BG folders
                     for sub_item in os.listdir(item_path):
-                         sub_item_path = os.path.join(item_path, sub_item) # Full path for isfile check
+                         sub_item_path = os.path.join(item_path, sub_item)
                          if os.path.isfile(sub_item_path) and sub_item.lower() == bg_filename.lower():
-                             actual_bg_filename = os.path.join(item, sub_item) # Keep relative path
+                             actual_bg_filename = os.path.join(item, sub_item)
                              break
                     if actual_bg_filename: break
-
 
             if actual_bg_filename:
                 image_path = os.path.join(extract_folder, actual_bg_filename)
@@ -404,14 +460,12 @@ def download_from_mirror(beatmapset_id):
                     logger.info(f"Loading background image from: {image_path}")
                     try:
                         bg_image_temp = Image.open(image_path)
-                        # Re-save to BytesIO to handle potential format issues or locks
                         img_bytes = BytesIO()
-                        # Ensure format is specified, default to PNG if unknown
                         img_format = Image.registered_extensions().get(os.path.splitext(image_path)[1].lower(), 'PNG')
                         bg_image_temp.save(img_bytes, format=img_format)
-                        bg_image_temp.close() # Close the file handle
+                        bg_image_temp.close()
                         img_bytes.seek(0)
-                        bg_image = Image.open(img_bytes).convert('RGB') # Ensure RGB after loading
+                        bg_image = Image.open(img_bytes).convert('RGB')
                         logger.info("Background image loaded successfully from mirror download.")
                     except Exception as e:
                         logger.error(f"Failed to load image file {image_path}: {e}")
@@ -419,6 +473,8 @@ def download_from_mirror(beatmapset_id):
                     logger.warning(f"Background image file specified in .osu not found: {image_path}")
             else:
                  logger.warning(f"Background filename '{bg_filename}' found in .osu, but no matching file found in archive (checked subdirs).")
+        else:
+            logger.warning("No background filename found in any parsed .osu files.")
 
     except requests.exceptions.RequestException as e:
         logger.warning(f"Mirror download failed for beatmapset {beatmapset_id}: {e}")
@@ -427,6 +483,7 @@ def download_from_mirror(beatmapset_id):
     except Exception as e:
         logger.error(f"An unexpected error occurred during mirror download/extraction for {beatmapset_id}: {e}")
     finally:
+        # Clean up temp folder regardless of success/failure
         if os.path.exists(extract_folder):
             max_retries = 3
             for i in range(max_retries):
@@ -440,12 +497,12 @@ def download_from_mirror(beatmapset_id):
                 except Exception as e:
                     logger.error(f"Failed to clean up temporary folder {extract_folder} (attempt {i+1}/{max_retries}): {e}")
                     if i < max_retries - 1:
-                        time.sleep(0.5) # Wait before retrying
+                        time.sleep(0.5)
                     else:
                         logger.error(f"Giving up on cleaning temporary folder {extract_folder} after {max_retries} attempts.")
-                        break # Stop retrying after max attempts
-    return bg_image
-
+                        break
+    # Return both bg_image (PIL Image or None) and osu_file_content (string or None)
+    return bg_image, osu_file_content
 
 def extract_ordr_code(ordr_url: str) -> str:
     """Pulls the code from ORDR URLs like https://link.issou.best/<code> or https://ordr.issou.best/watch/<code>"""
@@ -556,27 +613,29 @@ def draw_text_with_effect(draw_surface, pos, text, font, fill,
                 if abs(dx) + abs(dy) > effect_radius: continue
                 draw_surface.text((x + dx, y + dy), text, font=font, fill=effect_color)
     elif effect_type == 'glow':
-        # Draw glow by drawing text multiple times with circular offsets
-        # Use a larger radius for glow effect
-        num_steps = max(8, effect_radius * 2) # More steps for smoother glow
-        for i in range(num_steps):
-            angle = 2 * math.pi * i / num_steps
-            # Vary distance slightly for a softer edge? Optional.
-            # dist = effect_radius * (0.5 + 0.5 * (i % 2)) # Example variation
-            dist = effect_radius
-            dx = int(round(dist * math.cos(angle)))
-            dy = int(round(dist * math.sin(angle)))
-            if dx == 0 and dy == 0: continue # Skip center
+        # --- Neon Glow Effect ---
+        # Draw multiple layers for a brighter, more spread-out glow
+        # Outer, slightly thicker layer
+        outer_radius = effect_radius + 1 # Slightly larger radius for spread
+        num_steps_outer = max(12, outer_radius * 3) # More steps for smoother outer glow
+        for i in range(num_steps_outer):
+            angle = 2 * math.pi * i / num_steps_outer
+            dx = int(round(outer_radius * math.cos(angle)))
+            dy = int(round(outer_radius * math.sin(angle)))
             draw_surface.text((x + dx, y + dy), text, font=font, fill=effect_color)
-        # Optionally draw intermediate steps for thicker glow
-        if effect_radius > 2:
-            for r in range(1, effect_radius):
-                 for i in range(num_steps):
-                    angle = 2 * math.pi * i / num_steps
-                    dx = int(round(r * math.cos(angle)))
-                    dy = int(round(r * math.sin(angle)))
-                    if dx == 0 and dy == 0 and r==0: continue
-                    draw_surface.text((x + dx, y + dy), text, font=font, fill=effect_color)
+
+        # Inner, denser layers (draw multiple times)
+        num_steps_inner = max(8, effect_radius * 2)
+        for r in range(effect_radius, 0, -1): # Draw from radius down to 1
+            for i in range(num_steps_inner):
+                angle = 2 * math.pi * i / num_steps_inner
+                dx = int(round(r * math.cos(angle)))
+                dy = int(round(r * math.sin(angle)))
+                # Draw the same point multiple times for density (especially for radius 1)
+                draw_surface.text((x + dx, y + dy), text, font=font, fill=effect_color)
+                if r == 1: # Draw center point extra times for brightness core
+                     draw_surface.text((x + dx, y + dy), text, font=font, fill=effect_color)
+
 
     # Draw the main text on top
     draw_surface.text(pos, text, font=font, fill=fill)
@@ -631,8 +690,84 @@ def adjust_font_size(text, initial_size, font_paths, max_width, min_size=20, ste
     logger.warning(f"Text '{text[:30]}...' exceeded max width {max_width} even at min font size {min_size}. Using min size. Final width: {width}")
     return font, width, height
 
-# --- Glow Effect Helper (No longer needed if modifying draw_text_with_effect) ---
-# def create_glow(image: Image.Image, radius: int, color: tuple) -> Image.Image: ...
+# --- CORRECTED: PP Calculation Helper using rosu-pp-py ---
+def get_theoretical_pp(osu_file_content: Optional[str], mods_enum: int, accuracy: Optional[float] = None,
+                       count300: Optional[int] = None, count100: Optional[int] = None, count50: Optional[int] = None,
+                       miss_count: int = 0) -> Optional[float]:
+    """
+    Calculates theoretical PP for a map with given mods and accuracy/counts using rosu-pp-py.
+    Requires the content of the .osu file.
+    Provide EITHER accuracy (percentage float, e.g., 99.5) OR hit counts (count300, count100, count50).
+    Counts take precedence if provided. miss_count defaults to 0 for FC calculation.
+    Returns PP value as float or None if calculation fails or rosu-pp-py is unavailable.
+    """
+    if not ROSU_PP_AVAILABLE:
+        logger.warning("Cannot calculate theoretical PP: rosu-pp-py library not available.")
+        return None
+
+    if not osu_file_content:
+        logger.warning("Cannot calculate theoretical PP: .osu file content not provided.")
+        return None
+
+    calc_method = "Unknown" # For logging
+    calculator = None # Initialize calculator variable
+
+    try:
+        # Parse the beatmap content
+        logger.debug("Parsing .osu file content with rosu-pp-py...")
+        beatmap = rosu_pp_py.Beatmap(bytes=osu_file_content.encode('utf-8'))
+        logger.debug("Parsing successful.")
+
+        # Removed diagnostic logging
+
+        # Prepare parameters for the Performance constructor
+        calc_params = {
+            "mods": mods_enum,
+            "misses": miss_count # Corrected keyword from n_misses to misses
+        }
+        calc_method = "Unknown" # For logging
+
+        if count300 is not None and count100 is not None and count50 is not None:
+            calc_params["n300"] = count300
+            calc_params["n100"] = count100
+            calc_params["n50"] = count50
+            calc_method = f"Counts (300:{count300}, 100:{count100}, 50:{count50}, Miss:{miss_count})"
+        elif accuracy is not None:
+            # Clamp accuracy between 0 and 100
+            accuracy = max(0.0, min(100.0, accuracy))
+            calc_params["acc"] = accuracy
+            calc_method = f"Accuracy ({accuracy:.2f}%, Miss:{miss_count})"
+        else:
+            logger.warning("Cannot calculate theoretical PP: Neither accuracy nor hit counts provided.")
+            return None
+
+        logger.info(f"Requesting theoretical PP using rosu-pp-py Performance with {calc_method} and mods integer: {mods_enum}")
+
+        # Create a Performance instance with the parameters
+        performance = rosu_pp_py.Performance(**calc_params)
+
+        # Perform the calculation by passing the beatmap to the performance instance
+        pp_result = performance.calculate(beatmap)
+        pp_value = pp_result.pp
+
+        logger.info(f"Theoretical PP calculated via rosu-pp-py: {pp_value:.2f}")
+        return float(pp_value)
+
+    # Removed misplaced except UnicodeDecodeError block that caused F821
+
+    except UnicodeDecodeError as e:
+        logger.error(f"Failed to decode .osu file content (likely invalid encoding): {e}")
+        return None
+    except AttributeError as e:
+        # Catch specific AttributeError if Calculate or other methods are missing
+        logger.error(f"Error during rosu-pp-py usage (AttributeError): {e}", exc_info=True)
+        logger.error("This might indicate an incompatible version of rosu-pp-py or incorrect usage.")
+        return None
+    except Exception as e:
+        # Catch other potential errors during parsing or calculation within rosu-pp-py
+        logger.error(f"Error during rosu-pp-py calculation: {e}", exc_info=True)
+        return None
+# --- END CORRECTED PP Calculation Helper ---
 
 
 def create_thumbnail(ordr_url, client_id=None, client_secret=None):
@@ -651,7 +786,8 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     # Extract fields from metadata
     username = meta.get("replayUsername", "Unknown Player")
     song_title = meta.get("mapTitle", "Unknown Song")
-    difficulty = meta.get("replayDifficulty", "Unknown Difficulty")
+    difficulty = meta.get("replayDifficulty", "Unknown Difficulty") # Keep original case for display
+    target_difficulty_name_ordr = difficulty # Store for mirror download lookup
     beatmapset_id = meta.get("mapID") # This is actually beatmapset ID from ORDR
     ordr_mods_enum = meta.get("modsEnum", 0) # Get mods enum directly from ORDR
 
@@ -667,7 +803,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     # Parse accuracy & stars from description (still useful as fallback/primary source)
     desc = meta.get("description", "")
     acc_match = re.search(r"Accuracy:\s*([\d.]+)%", desc)
-    accuracy = float(acc_match.group(1)) if acc_match else 0.0
+    accuracy = float(acc_match.group(1)) if acc_match else 0.0 # Store as float for PP calc
     accuracy_str = f"{accuracy:.2f}%"
 
     star_match = re.search(r"\(([\d.]+) ⭐\)", desc) # Match stars like (5.67 ⭐)
@@ -683,12 +819,14 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     token = None
     beatmapset_data = None
     user_data = None
-    pp = 0.0 # Default PP
+    fetched_pp = 0.0 # PP from the actual score
     beatmap_id = None # Specific difficulty ID
+    beatmap_max_combo = None # Store max combo for the specific beatmap difficulty
     mods_source = "ORDR Enum" # Track where the final mods came from
     rank = 'D' # Default rank
-    is_fc = False # Default FC status
+    is_true_fc = False # Default "True FC" status (0 misses AND 0 slider breaks, verified by PP check or combo check)
     api_mods_list = None # Store mods list from API score if available
+    osu_file_content = None # Store content of the .osu file
 
     # Fetch API data if credentials provided
     if client_id and client_secret:
@@ -706,16 +844,22 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
             logger.warning(f"Failed to fetch initial API data: {e}. Proceeding with limited info.")
             # Continue without API data if possible, features like PP/Avatar/API Mods/Modded Stars might fail
 
-    # Get background image: Try mirror first, then API
-    logger.info(f"Attempting to get background for beatmapset ID: {beatmapset_id}")
-    bg_image = download_from_mirror(beatmapset_id)
+    # Get background image AND .osu file content: Try mirror first, then API for background only
+    logger.info(f"Attempting to get background and .osu content for beatmapset ID: {beatmapset_id}, Difficulty: '{target_difficulty_name_ordr}'")
+    bg_image, osu_file_content = download_from_mirror(beatmapset_id, target_difficulty_name_ordr)
 
-    if not bg_image and beatmapset_data: # Use fetched beatmapset_data if available
+    if osu_file_content:
+        logger.info(f"Successfully obtained .osu file content for '{target_difficulty_name_ordr}' from mirror.")
+    else:
+        logger.warning(f"Could not obtain .osu file content for '{target_difficulty_name_ordr}' from mirror. Theoretical PP calculation for FC check will be skipped.")
+        # Note: We might still get the beatmap_id later via API to fetch score/rank etc.
+
+    if not bg_image and beatmapset_data: # Use fetched beatmapset_data if available for background fallback
         covers = beatmapset_data.get("covers", {})
         # Prefer cover@2x for higher resolution, fallback to cover
         bg_url = covers.get("cover@2x") or covers.get("cover")
         if bg_url:
-            logger.info("Using background from osu! API")
+            logger.info("Using background from osu! API (fallback)")
             try:
                 response = requests.get(bg_url, timeout=15)
                 response.raise_for_status()
@@ -923,16 +1067,18 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     # Note: mods_str and final_mods_enum are initialized using ORDR data as a fallback.
     if token and user_id and beatmapset_data: # Check if we have API token, user ID, and beatmapset data
         try:
-            target_difficulty_name = meta.get('replayDifficulty', '')
-            logger.info(f"Attempting to find beatmap ID for difficulty: '{target_difficulty_name}' in set {beatmapset_id}")
+            # Use the difficulty name from ORDR metadata for matching
+            target_difficulty_name_api = meta.get('replayDifficulty', '')
+            logger.info(f"Attempting to find beatmap ID for difficulty: '{target_difficulty_name_api}' in set {beatmapset_id}")
 
             # Find the beatmap ID for the specific difficulty within the set
             found_map = False
             base_stars_from_api = 0.0 # Store base star rating from API beatmap data
             for beatmap in beatmapset_data.get('beatmaps', []):
                 # Compare difficulty names (case-insensitive and strip whitespace)
-                if beatmap.get('version', '').strip().lower() == target_difficulty_name.strip().lower():
+                if beatmap.get('version', '').strip().lower() == target_difficulty_name_api.strip().lower():
                     beatmap_id = beatmap.get('id')
+                    beatmap_max_combo = beatmap.get('max_combo') # Store beatmap max combo
                     # Get base star rating from API beatmap data
                     api_stars = beatmap.get('difficulty_rating')
                     if api_stars:
@@ -945,7 +1091,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
                             logger.info(f"Using base stars from API beatmap data: {stars_str}")
                         else:
                             logger.info(f"API base stars available ({api_stars:.2f}), but keeping initial stars from ORDR description ({stars:.2f}) for now.")
-                    logger.info(f"Found matching beatmap ID: {beatmap_id} for difficulty '{target_difficulty_name}'. API Base Stars: {base_stars_from_api:.2f}")
+                    logger.info(f"Found matching beatmap ID: {beatmap_id} for difficulty '{target_difficulty_name_api}'. API Base Stars: {base_stars_from_api:.2f}, Map Max Combo: {beatmap_max_combo}")
                     found_map = True
                     break
 
@@ -965,6 +1111,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
                      # Allow a small tolerance for star rating match
                      if closest_map and min_diff < 0.1:
                          beatmap_id = closest_map.get('id')
+                         beatmap_max_combo = closest_map.get('max_combo') # Store beatmap max combo
                          api_stars = closest_map.get('difficulty_rating')
                          actual_diff_name = closest_map.get('version', 'Unknown Difficulty')
                          if api_stars:
@@ -977,49 +1124,55 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
                                  logger.info(f"Using base stars from API beatmap data (fallback match): {stars_str}")
                              else:
                                  logger.info(f"API base stars available ({api_stars:.2f}) from fallback match, but keeping initial stars from ORDR description ({stars:.2f}) for now.")
-                         logger.info(f"Found closest beatmap by stars: ID {beatmap_id}, Diff '{actual_diff_name}', Base Stars {base_stars_from_api:.2f} (Difference: {min_diff:.3f})")
-                         difficulty = actual_diff_name # Update difficulty name to the matched one
+                         logger.info(f"Found closest beatmap by stars: ID {beatmap_id}, Diff '{actual_diff_name}', Base Stars {base_stars_from_api:.2f}, Map Max Combo: {beatmap_max_combo} (Difference: {min_diff:.3f})")
+                         difficulty = actual_diff_name # Update difficulty name for display to the matched one
                          found_map = True
                      else:
                          logger.warning(f"Could not find a close match by star rating either (min diff: {min_diff:.3f}).")
 
             if found_map and beatmap_id:
                 # --- Fetch User's Best Score on the Map ---
-                logger.info(f"Fetching score details for user {user_id} on beatmap {beatmap_id} (for PP, Mods, Rank override)")
-                # Note: The /scores endpoint might not return the *exact* score from the replay if multiple scores exist.
-                # It usually returns the user's best score on that map.
+                logger.info(f"Fetching score details for user {user_id} on beatmap {beatmap_id} (for PP, Mods, Rank, FC override)")
                 score_data = make_api_request(token, f"beatmaps/{beatmap_id}/scores/users/{user_id}")
                 score_info = score_data.get("score")
                 if score_info:
-                    fetched_pp = score_info.get("pp")
-                    if fetched_pp is not None: # PP can be 0.0, so check for None
-                        pp = float(fetched_pp)
-                        logger.info(f"Fetched PP from user's best score: {pp:.2f}")
+                    # Get actual PP achieved in the score
+                    fetched_pp_val = score_info.get("pp")
+                    if fetched_pp_val is not None:
+                        fetched_pp = float(fetched_pp_val)
+                        logger.info(f"Fetched PP from user's best score: {fetched_pp:.2f}")
                     else:
-                        pp = 0.0 # Handle null PP (e.g., loved maps)
+                        fetched_pp = 0.0 # Handle null PP (e.g., loved maps)
                         logger.info("API returned null PP for the score, setting to 0.")
 
                     # Get Rank
                     fetched_rank = score_info.get("rank")
                     if fetched_rank:
-                        rank = fetched_rank # e.g., "A", "S", "SH", "X", "XH"
+                        rank = fetched_rank
                         logger.info(f"Fetched Rank from user's best score: {rank}")
                     else:
-                        rank = 'D' # Default if rank is missing
+                        rank = 'D'
                         logger.warning("Rank not found in API score data, defaulting to D.")
 
-                    # Get FC status
-                    is_fc = score_info.get("perfect", False)
-                    logger.info(f"Fetched FC status from user's best score: {is_fc}")
+                    # Get miss count, hit counts, and score max combo
+                    stats = score_info.get("statistics", {})
+                    miss_count = stats.get("count_miss", -1) # Keep -1 if not found? Or default 0? Let's use -1 to indicate unknown.
+                    # --- FIX START: Complete the following lines ---
+                    count_300 = stats.get("count_300", 0)
+                    count_100 = stats.get("count_100", 0)
+                    count_50 = stats.get("count_50", 0)
+                    score_max_combo = score_info.get("max_combo", 0)
+                    # --- FIX END ---
+                    logger.info(f"Score Stats - Miss: {miss_count}, 300: {count_300}, 100: {count_100}, 50: {count_50}, Combo: {score_max_combo}")
 
-                    # Mod Override Logic
+                    # Mod Override Logic (BEFORE True FC check, as mods affect PP calc)
                     api_mods_list = score_info.get("mods", []) # Store this list
                     if api_mods_list:
                         api_mods_str = "".join(api_mods_list)
                         logger.info(f"Found mods from API score: {api_mods_str}. Overriding mods from ORDR enum.")
                         mods_str = api_mods_str
                         mods_source = "osu! API Score"
-                        # Convert API mod list back to enum for star calculation
+                        # Convert API mod list back to enum for star calculation AND PP calculation
                         final_mods_enum = get_mods_enum_from_list(api_mods_list)
                         logger.info(f"Converted API mods list {api_mods_list} to enum: {final_mods_enum}")
                     elif not api_mods_list and mods_str != "NM":
@@ -1031,11 +1184,72 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
                         mods_source = "osu! API Score (NM)"
                         final_mods_enum = Mods.NoMod # Ensure enum is also NM
 
+                    # --- Determine "True FC" status ---
+                    # Requires miss_count, hit counts, final_mods_enum, osu_file_content, score_max_combo, beatmap_max_combo
+                    if miss_count == 0:
+                        logger.info("Miss count is 0. Prioritizing combo check for FC status.")
+                        # 1. Check combo first
+                        if beatmap_max_combo is not None and score_max_combo >= beatmap_max_combo:
+                            is_true_fc = True
+                            logger.info(f"Determined True FC: Yes (Combo Check: Score Combo={score_max_combo}, Map Combo={beatmap_max_combo})")
+                        else:
+                            # Combo check failed or not possible, proceed to PP check
+                            reason = []
+                            if beatmap_max_combo is None: reason.append("Map Max Combo unknown")
+                            elif score_max_combo < beatmap_max_combo: reason.append(f"Score Combo={score_max_combo} < Map Combo={beatmap_max_combo}")
+                            logger.info(f"Combo check inconclusive ({', '.join(reason)}). Attempting PP comparison for FC check using rosu-pp-py.")
+
+                            # 2. Try calculating theoretical PP for an FC with this accuracy/mods using exact hit counts
+                            theoretical_pp = get_theoretical_pp(
+                                osu_file_content=osu_file_content, # Use the fetched content
+                                mods_enum=final_mods_enum, # Use the final mods
+                                count300=count_300,
+                                count100=count_100,
+                                count50=count_50,
+                                miss_count=0 # Explicitly set 0 misses for FC calc
+                            )
+
+                            if theoretical_pp is not None:
+                                # Compare fetched PP with theoretical PP (allow 15% relative difference)
+                                pp_relative_tolerance = 0.05 # 5%
+                                difference = abs(fetched_pp - theoretical_pp)
+                                # Handle theoretical_pp being zero or very small
+                                if theoretical_pp > 1e-6: # Avoid division by zero/large relative error for tiny PP values
+                                    is_match = (difference / theoretical_pp) <= pp_relative_tolerance
+                                else:
+                                    # If theoretical PP is essentially zero, fetched PP must also be essentially zero
+                                    is_match = difference <= 1e-6 # Use a very small absolute tolerance for zero case
+
+                                if is_match:
+                                    is_true_fc = True
+                                    logger.info(f"Determined True FC: Yes (PP Match: Fetched={fetched_pp:.2f}, Theoretical={theoretical_pp:.2f}, Relative Difference <= {pp_relative_tolerance*100:.0f}%)")
+                                else:
+                                    is_true_fc = False
+                                    relative_diff_str = f"{(difference / theoretical_pp * 100):.1f}%" if theoretical_pp > 1e-6 else "N/A (Theoretical PP is zero)"
+                                    logger.info(f"Determined True FC: No (PP Mismatch: Fetched={fetched_pp:.2f}, Theoretical={theoretical_pp:.2f}, Relative Difference={relative_diff_str} > {pp_relative_tolerance*100:.0f}%) - Likely slider break.")
+                            else:
+                                # PP calculation failed or skipped, and combo check already failed/inconclusive
+                                is_true_fc = False
+                                logger.warning("Theoretical PP calculation failed or skipped, and combo check was inconclusive. Determined True FC: No.")
+
+                    elif miss_count > 0:
+                        # Not an FC if misses > 0
+                        is_true_fc = False
+                        logger.info(f"Determined True FC: No (Miss Count={miss_count})")
+                    else: # miss_count is -1 (unknown)
+                        is_true_fc = False
+                        logger.info(f"Determined True FC: No (Miss Count unknown from API)")
+
+
+                    # Log the API 'perfect' flag for comparison/debugging
+                    api_perfect_flag = score_info.get("perfect", False)
+                    logger.info(f"API 'perfect' flag value (for info only): {api_perfect_flag}")
+
                 else: # This else corresponds to 'if score_info:'
-                    logger.warning(f"Score not found via API for user {user_id} on beatmap {beatmap_id}. PP set to 0. Rank set to D. FC status unknown. Using mods from ORDR enum ('{mods_str}', enum {final_mods_enum}).")
-                    pp = 0.0
+                    logger.warning(f"Score not found via API for user {user_id} on beatmap {beatmap_id}. PP set to 0. Rank set to D. True FC status unknown. Using mods from ORDR enum ('{mods_str}', enum {final_mods_enum}).")
+                    fetched_pp = 0.0 # Reset PP if score not found
                     rank = 'D'
-                    is_fc = False # Assume not FC if score not found
+                    is_true_fc = False # Assume not True FC if score not found
                     # Keep mods_str and final_mods_enum from ORDR
 
                 # --- Fetch Modded Star Rating ---
@@ -1056,25 +1270,27 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
                     logger.error(f"Failed to fetch modded difficulty attributes: {attr_e}. Falling back to previous star rating ({stars_str}, Source: {stars_source}).")
 
             else: # This else corresponds to 'if found_map and beatmap_id:'
-                logger.warning(f"Could not find matching beatmap ID for difficulty '{target_difficulty_name}' in beatmapset {beatmapset_id}. Cannot fetch PP/Rank/FC or override mods/stars. Using mods from ORDR enum ('{mods_str}') and stars from '{stars_source}' ({stars_str}).")
+                logger.warning(f"Could not find matching beatmap ID for difficulty '{target_difficulty_name_api}' in beatmapset {beatmapset_id}. Cannot fetch PP/Rank/FC or override mods/stars. Using mods from ORDR enum ('{mods_str}') and stars from '{stars_source}' ({stars_str}).")
                 rank = 'D' # Default rank if map not found
-                is_fc = False # Assume not FC if map not found
+                is_true_fc = False # Assume not True FC if map not found
                 # Keep mods_str, final_mods_enum, stars, stars_str from earlier steps
 
         except Exception as e:
             logger.error(f"Could not fetch PP/Score/Rank/FC/Stars details: {e}", exc_info=True)
-            logger.warning(f"Proceeding with default PP (0.0), Rank (D), FC (False), mods from ORDR enum ('{mods_str}'), and stars from '{stars_source}' ({stars_str}).")
+            logger.warning(f"Proceeding with default PP (0.0), Rank (D), True FC (False), mods from ORDR enum ('{mods_str}'), and stars from '{stars_source}' ({stars_str}).")
+            fetched_pp = 0.0 # Reset PP on error
             rank = 'D' # Default rank on error
-            is_fc = False # Default FC on error
+            is_true_fc = False # Default True FC on error
             # Keep mods_str, final_mods_enum, stars, stars_str from earlier steps
 
     else: # No API credentials provided or initial API fetch failed
-         logger.info(f"No API credentials or data available. Using default PP (0.0), Rank (D), FC (False), mods from ORDR enum ('{mods_str}'), and stars from '{stars_source}' ({stars_str}).")
+         logger.info(f"No API credentials or data available. Using default PP (0.0), Rank (D), True FC (False), mods from ORDR enum ('{mods_str}'), and stars from '{stars_source}' ({stars_str}).")
+         fetched_pp = 0.0 # Default PP
          rank = 'D' # Default rank
-         is_fc = False # Default FC
+         is_true_fc = False # Default True FC
          # Keep mods_str, final_mods_enum, stars, stars_str from earlier steps
 
-    logger.info(f"Final values - PP: {pp:.2f}, Mods: {mods_str} (Source: {mods_source}, Enum: {final_mods_enum}), Rank: {rank}, FC: {is_fc}, Stars: {stars_str} (Source: {stars_source})")
+    logger.info(f"Final values - PP: {fetched_pp:.2f}, Mods: {mods_str} (Source: {mods_source}, Enum: {final_mods_enum}), Rank: {rank}, True FC (0 Miss + PP/Combo Check): {is_true_fc}, Stars: {stars_str} (Source: {stars_source})")
 
     # --- Text Drawing ---
     text_color = (255, 255, 255)
@@ -1090,7 +1306,8 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     horizontal_spacing_rank_mods = 40 # Spacing between rank text and mods text
     horizontal_spacing_star_num = 5 # Small gap between number and star emoji
     star_emoji_vertical_offset = 5 # Pixels to push emoji down relative to number's top
-    rank_glow_radius = 5 # Define glow radius for rank text
+    rank_glow_radius = 6 # Increased glow radius for Rank neon effect
+    fc_glow_radius = 7 # Increased glow radius for FC neon effect
 
     # Using RGBA for potential transparency in glow
     RANK_BASE_COLORS = {
@@ -1111,6 +1328,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     }
     SILVER_BASE_COLOR = (192, 192, 192, 255) # Silver
     SILVER_GLOW_COLOR = (230, 230, 230, 180) # Light Silver
+    FC_GLOW_COLOR = (255, 255, 150, 180) # Bright Yellow Glow for FC
 
     # Define maximum widths for dynamic text areas
     max_title_width = target_width / 2
@@ -1132,6 +1350,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     logger.info(f"Drew map title at ({center_x}, {title_y}) with adjusted font size {font_map_title.size} (Height: {title_height}, MaxWidth: {max_title_width})")
 
     # 2. Difficulty Name (Under Map Title) - Adjust Font Size
+    # Use the 'difficulty' variable which might have been updated by the star rating fallback match
     difficulty_text = "[" + difficulty + "]"
     font_difficulty, diff_width, diff_height = adjust_font_size(
         difficulty_text,
@@ -1168,12 +1387,13 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
 
     rank_text = rank[0] # Get the base letter (D, C, B, A, S, X)
     is_hidden_rank = rank.endswith('H') # Check if it's SH or XH
-    use_silver = is_hidden_rank or (rank in ['S', 'X'] and Mods.Hidden in final_mods_enum)
+    # Determine if silver rank should be used based on API rank OR if rank is S/X and HD mod is present
+    use_silver = is_hidden_rank or (rank_text in ['S', 'X'] and Mods.Hidden in final_mods_enum)
 
     if use_silver:
         rank_base_color = SILVER_BASE_COLOR
         rank_glow_color = SILVER_GLOW_COLOR
-        logger.info(f"Using Silver color scheme for rank '{rank}' (Hidden mod detected).")
+        logger.info(f"Using Silver color scheme for rank '{rank}' (Hidden mod detected or SH/XH rank).")
     else:
         rank_base_color = RANK_BASE_COLORS.get(rank_text, (255, 255, 255, 255)) # Default white
         rank_glow_color = RANK_GLOW_COLORS.get(rank_text, (200, 200, 200, 180)) # Default light gray glow
@@ -1209,16 +1429,16 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     mods_x_start = left_x_end - mods_width
     rank_x = mods_x_start - horizontal_spacing_rank_mods - rank_width
 
-    # Draw the rank text with glow
+    # Draw the rank text with neon glow
     draw_text_with_effect(draw, (int(rank_x), int(rank_y)), rank_text, font_rank,
                           fill=rank_base_color,
                           effect_type='glow',
                           effect_color=rank_glow_color,
-                          effect_radius=rank_glow_radius)
-    logger.info(f"Drew rank text '{rank_text}' with glow at ({int(rank_x)}, {int(rank_y)}) (Bottom aligned with mods)")
+                          effect_radius=rank_glow_radius) # Uses updated rank_glow_radius
+    logger.info(f"Drew rank text '{rank_text}' with neon glow at ({int(rank_x)}, {int(rank_y)}) (Bottom aligned with mods)")
 
     # --- Calculate positions for right block (PP, Stars) ---
-    pp_text = f"{pp:.0f}PP"
+    pp_text = f"{fetched_pp:.0f}PP" # Display the fetched PP
     pp_width, pp_height = get_text_dimensions(font_pp_stars, pp_text)
     star_number_text = stars_str # Use the potentially modded star rating string
     star_emoji_text = "⭐"
@@ -1253,15 +1473,21 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
                           effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
     logger.info(f"Drew stars number at ({stars_x}, {stars_y}) and emoji at ({star_emoji_x}, {int(star_emoji_y)}) (using {star_emoji_vertical_offset}px vertical offset)")
 
-    # --- Draw FC Text if applicable ---
-    if is_fc:
+    # --- Draw FC Text if applicable (based on 0 misses AND PP/combo check) ---
+    if is_true_fc: # Use the result of the PP comparison or combo fallback
         fc_text = "FC"
         fc_pos_x = 50 # Left margin
         fc_pos_y = 30 # Top margin
-        # Use star_color for the fill color, maybe add glow? Let's stick to outline for now.
-        draw_text_with_effect(draw, (fc_pos_x, fc_pos_y), fc_text, font_fc, star_color,
-                              effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
-        logger.info(f"Drew FC text at ({fc_pos_x}, {fc_pos_y})")
+        # Use star_color for fill, FC_GLOW_COLOR for neon effect
+        draw_text_with_effect(draw, (fc_pos_x, fc_pos_y), fc_text, font_fc,
+                              fill=star_color, # Base color (Gold)
+                              effect_type='glow',
+                              effect_color=FC_GLOW_COLOR, # Glow color (Bright Yellow)
+                              effect_radius=fc_glow_radius) # Use defined FC glow radius
+        logger.info(f"Drew FC text with neon glow at ({fc_pos_x}, {fc_pos_y}) because True FC conditions were met.")
+    else:
+        logger.info("Skipping FC text because True FC conditions were not met (misses > 0 or PP/combo check failed).")
+
 
     # --- Save result ---
     output_dir = "thumbnails"
