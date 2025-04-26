@@ -1,6 +1,6 @@
 import requests
 import zipfile
-from PIL import Image, ImageDraw, ImageFont, ImageFilter # Added ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from io import BytesIO
 import os
 from dotenv import load_dotenv
@@ -16,12 +16,15 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QLineEdit,
                             QPushButton, QVBoxLayout, QWidget, QMessageBox,
                             QTextEdit)
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread
+from PyQt5.QtGui import QTextCursor
 import logging
 from enum import IntFlag
+import math # Import math for glow effect calculation
 
 # --- Setup logging early ---
+LOG_FILENAME = 'thumbnail_generator.log' # Define log filename constant
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-log_file_handler = logging.FileHandler('thumbnail_generator.log')
+log_file_handler = logging.FileHandler(LOG_FILENAME) # Use constant
 log_file_handler.setFormatter(log_formatter)
 
 logger = logging.getLogger(__name__)
@@ -56,16 +59,12 @@ class Worker(QObject):
         """Runs the thumbnail creation task."""
         try:
             logger.info("Worker thread started for thumbnail generation.")
-            create_thumbnail(self.ordr_url, self.client_id, self.client_secret)
-            # logger.info("Worker thread finished successfully.")
-            # Emit success message only if create_thumbnail doesn't raise an error
-            self.finished.emit(True, "Thumbnail created successfully as thumbnail.jpg!")
+            output_filename = create_thumbnail(self.ordr_url, self.client_id, self.client_secret)
+            self.finished.emit(True, f"Thumbnail created successfully as {output_filename}!")
         except (ValueError, RuntimeError) as user_error:
-            # Catch specific errors meant for the user
             logger.error(f"Worker thread failed (User Error): {user_error}")
             self.finished.emit(False, f"{str(user_error)}")
         except Exception as e:
-            # Catch unexpected errors
             logger.exception("Worker thread failed (Unexpected Error):") # Log full traceback
             self.finished.emit(False, f"An unexpected error occurred:\n{str(e)}\n\nCheck logs for details.")
         finally:
@@ -466,7 +465,7 @@ def fetch_ordr_metadata(link_code: str) -> dict:
     params = {"link": link_code}
     logger.info(f"Fetching ORDR metadata for code: {link_code} from {url}")
     try:
-        resp = requests.get(url, params=params, timeout=15) # Added timeout
+        resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
         data = resp.json()
         if not data.get("renders"):
@@ -503,6 +502,26 @@ def resource_path(relative_path):
     logger.debug(f"Resource path check: Resolved '{relative_path}' to '{path}'")
     return path
 
+# --- Font Finding Helper ---
+def find_font(paths, size):
+    """Finds and loads a font from a list of paths at a given size."""
+    # Check provided paths (already resolved by resource_path or absolute)
+    for path in paths:
+        try:
+            # Add logging before loading font
+            # logger.debug(f"Attempting to load font from: {path} at size {size}") # Make debug
+            # logger.debug(f"Does font path exist? {os.path.exists(path)}")
+            if os.path.exists(path):
+                # logger.debug(f"Loading font: {path} with size {size}")
+                return ImageFont.truetype(path, size)
+            else:
+                logger.debug(f"Font path not found: {path}")
+        except IOError as e:
+            logger.warning(f"Could not load font {path} with size {size}: {e}")
+
+    logger.error(f"Could not find any suitable font in paths: {paths} for size {size}. Using default.")
+    return ImageFont.load_default(size) # Pass size to default loader
+
 # --- Text Dimension Helper Functions ---
 def get_text_dimensions(font, text):
     """Gets width and height of text using the most reliable method."""
@@ -523,91 +542,102 @@ def get_text_dimensions(font, text):
              return 10, 10
 
 # --- Text Drawing Helper Functions ---
-def draw_text_with_outline(draw_surface, pos, text, font, fill, outline_fill, outline_width):
-    """Draws text with a multi-pass outline."""
+def draw_text_with_effect(draw_surface, pos, text, font, fill,
+                          effect_type='outline', effect_color=(0,0,0), effect_radius=2):
+    """Draws text with an outline or glow effect."""
     x, y = pos
-    # Draw outline by drawing text multiple times with offsets
-    for dx in range(-outline_width, outline_width + 1):
-        for dy in range(-outline_width, outline_width + 1):
-            # Skip the center position for the outline pass
-            if dx == 0 and dy == 0:
-                continue
-            # Basic check to avoid drawing too far out (optional optimization)
-            # Use Manhattan distance for simplicity and performance
-            if abs(dx) + abs(dy) > outline_width:
-                 continue
-            draw_surface.text((x + dx, y + dy), text, font=font, fill=outline_fill)
+
+    if effect_type == 'outline':
+        # Draw outline by drawing text multiple times with offsets
+        for dx in range(-effect_radius, effect_radius + 1):
+            for dy in range(-effect_radius, effect_radius + 1):
+                if dx == 0 and dy == 0: continue
+                # Use Manhattan distance for simple outline
+                if abs(dx) + abs(dy) > effect_radius: continue
+                draw_surface.text((x + dx, y + dy), text, font=font, fill=effect_color)
+    elif effect_type == 'glow':
+        # Draw glow by drawing text multiple times with circular offsets
+        # Use a larger radius for glow effect
+        num_steps = max(8, effect_radius * 2) # More steps for smoother glow
+        for i in range(num_steps):
+            angle = 2 * math.pi * i / num_steps
+            # Vary distance slightly for a softer edge? Optional.
+            # dist = effect_radius * (0.5 + 0.5 * (i % 2)) # Example variation
+            dist = effect_radius
+            dx = int(round(dist * math.cos(angle)))
+            dy = int(round(dist * math.sin(angle)))
+            if dx == 0 and dy == 0: continue # Skip center
+            draw_surface.text((x + dx, y + dy), text, font=font, fill=effect_color)
+        # Optionally draw intermediate steps for thicker glow
+        if effect_radius > 2:
+            for r in range(1, effect_radius):
+                 for i in range(num_steps):
+                    angle = 2 * math.pi * i / num_steps
+                    dx = int(round(r * math.cos(angle)))
+                    dy = int(round(r * math.sin(angle)))
+                    if dx == 0 and dy == 0 and r==0: continue
+                    draw_surface.text((x + dx, y + dy), text, font=font, fill=effect_color)
+
     # Draw the main text on top
     draw_surface.text(pos, text, font=font, fill=fill)
 
-def draw_centered_text_with_outline(draw_surface, center_x, y_pos, text, font, fill, outline_fill, outline_width):
-    """Draws text horizontally centered at center_x with an outline."""
+def draw_centered_text_with_effect(draw_surface, center_x, y_pos, text, font, fill,
+                                   effect_type='outline', effect_color=(0,0,0), effect_radius=2):
+    """Draws text horizontally centered at center_x with an effect."""
     text_width, _ = get_text_dimensions(font, text)
     x_pos = center_x - (text_width / 2)
-    draw_text_with_outline(draw_surface, (x_pos, y_pos), text, font, fill, outline_fill, outline_width)
+    draw_text_with_effect(draw_surface, (x_pos, y_pos), text, font, fill,
+                          effect_type, effect_color, effect_radius)
 
-def draw_right_aligned_text_with_outline(draw_surface, right_x, y_pos, text, font, fill, outline_fill, outline_width):
-    """Draws text right-aligned ending at right_x with an outline."""
+def draw_right_aligned_text_with_effect(draw_surface, right_x, y_pos, text, font, fill,
+                                        effect_type='outline', effect_color=(0,0,0), effect_radius=2):
+    """Draws text right-aligned ending at right_x with an effect."""
     text_width, _ = get_text_dimensions(font, text)
     x_pos = right_x - text_width
-    draw_text_with_outline(draw_surface, (x_pos, y_pos), text, font, fill, outline_fill, outline_width)
+    draw_text_with_effect(draw_surface, (x_pos, y_pos), text, font, fill,
+                          effect_type, effect_color, effect_radius)
 
-# --- Truncation Helper Function ---
-def truncate_text(text, font, max_width):
-    """Truncates text with '...' if it exceeds max_width."""
-    try:
-        # Prefer getlength if available (more accurate for TrueType)
-        text_width = font.getlength(text)
-    except AttributeError:
-        try:
-            # Fallback to getbbox
-            bbox = font.getbbox(text)
-            text_width = bbox[2] - bbox[0]
-        except AttributeError:
-            try:
-                # Fallback for older PIL/Pillow or non-TrueType fonts
-                text_width = font.getsize(text)[0]
-            except Exception:
-                logger.warning(f"Could not get width for text '{text}' with font {font}. Truncation might be inaccurate.")
-                # Basic estimation if all else fails
-                avg_char_width = font.getsize("A")[0] if hasattr(font, 'getsize') else 10
-                text_width = len(text) * avg_char_width
+# --- Font Size Adjustment Helper ---
+def adjust_font_size(text, initial_size, font_paths, max_width, min_size=20, step=2):
+    """
+    Adjusts font size dynamically to fit text within max_width.
+    Starts at initial_size and decreases by step until it fits or hits min_size.
+    Returns the adjusted font object and its final dimensions (width, height).
+    """
+    current_size = initial_size
+    font = None
+    width = float('inf')
+    height = 0
 
+    logger.debug(f"Adjusting font for text '{text[:30]}...' Initial: {initial_size}, MaxWidth: {max_width}, Min: {min_size}")
 
-    if text_width <= max_width:
-        return text
-    else:
-        # Estimate ellipsis width using the same method hierarchy
-        try: ellipsis_width = font.getlength("...")
-        except AttributeError:
-            try: ellipsis_width = font.getbbox("...")[2] - font.getbbox("...")[0]
-            except AttributeError:
-                try: ellipsis_width = font.getsize("...")[0]
-                except Exception: ellipsis_width = 30
+    while current_size >= min_size:
+        font = find_font(font_paths, current_size)
+        width, height = get_text_dimensions(font, text)
+        logger.debug(f"Trying size {current_size}: width={width}")
 
-        truncated = ""
-        # Iterate backwards to find suitable truncation point
-        for i in range(len(text) -1, 0, -1):
-            test_text = text[:i]
-            # Get width of truncated text using the same method hierarchy
-            try: test_width = font.getlength(test_text)
-            except AttributeError:
-                try: test_width = font.getbbox(test_text)[2] - font.getbbox(test_text)[0]
-                except AttributeError:
-                    try: test_width = font.getsize(test_text)[0]
-                    except Exception: test_width = i * 10 # Estimate
+        if width <= max_width:
+            logger.debug(f"Fit found at size {current_size} (Width: {width})")
+            return font, width, height # Found a size that fits
 
-            if test_width + ellipsis_width <= max_width:
-                truncated = test_text + "..."
-                break
-        # Return ellipsis if text is too short to truncate or truncation failed
-        return truncated if truncated else "..."
+        current_size -= step # Decrease size and try again
+
+    # If loop finishes, it means min_size was reached but text still didn't fit
+    # Use the font and dimensions from the last iteration (min_size)
+    if font is None: # Should only happen if initial_size < min_size
+        font = find_font(font_paths, min_size)
+        width, height = get_text_dimensions(font, text)
+
+    logger.warning(f"Text '{text[:30]}...' exceeded max width {max_width} even at min font size {min_size}. Using min size. Final width: {width}")
+    return font, width, height
+
+# --- Glow Effect Helper (No longer needed if modifying draw_text_with_effect) ---
+# def create_glow(image: Image.Image, radius: int, color: tuple) -> Image.Image: ...
 
 
 def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     """Create osu! thumbnail from ORDR render link.
-       NOTE: This function now assumes it might be called from a worker thread.
-       It should raise exceptions on failure for the worker to catch.
+       Returns the filename of the created thumbnail.
     """
     # No try/except block here - let the caller (Worker.run) handle exceptions
     if not ordr_url:
@@ -615,7 +645,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
         raise ValueError("ORDR URL is required")
 
     logger.info(f"Generating thumbnail from ORDR URL: {ordr_url}")
-    code = extract_ordr_code(ordr_url)
+    code = extract_ordr_code(ordr_url) # Capture code for filename
     meta = fetch_ordr_metadata(code)
 
     # Extract fields from metadata
@@ -734,33 +764,44 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
 
     # Apply blur to the base thumbnail
     blur_radius = 5 # Adjust this value for more/less blur
-    thumbnail = thumbnail_base.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    thumbnail_blurred = thumbnail_base.filter(ImageFilter.GaussianBlur(radius=blur_radius))
     logger.info(f"Applied Gaussian blur with radius {blur_radius} to background.")
 
-    # Re-initialize Draw object on the potentially blurred image
+    # Apply dimming
+    thumbnail_blurred = thumbnail_blurred.convert("RGBA") # Ensure RGBA for compositing
+    dim_alpha = 100 # Adjust 0-255 for less/more dimming (e.g., 100 is moderate)
+    dim_layer = Image.new('RGBA', thumbnail_blurred.size, (0, 0, 0, 0)) # Transparent layer
+    draw_dim = ImageDraw.Draw(dim_layer)
+    draw_dim.rectangle([(0,0), thumbnail_blurred.size], fill=(0, 0, 0, dim_alpha)) # Draw semi-transparent black
+    thumbnail = Image.alpha_composite(thumbnail_blurred, dim_layer) # Composite dim layer onto blurred image
+    logger.info(f"Applied dimming overlay with alpha {dim_alpha}.")
+
+    # Re-initialize Draw object on the dimmed and blurred image
+    # Draw needs RGBA for alpha compositing of glow/rank
+    # thumbnail is already RGBA after alpha_composite
     draw = ImageDraw.Draw(thumbnail)
 
-    # Add asset1.png overlay FIRST (after blur, before other elements)
+    # Add overlay.png overlay FIRST (after blur/dim, before other elements)
     try:
-        asset_path = resource_path(os.path.join("assets", "asset1.png"))
-        # Add logging before loading asset1.png
-        logger.info(f"Attempting to load asset1.png from: {asset_path}")
-        logger.info(f"Does asset1.png path exist? {os.path.exists(asset_path)}")
+        asset_path = resource_path(os.path.join("assets", "overlay.png"))
+        # Add logging before loading overlay.png
+        logger.info(f"Attempting to load overlay.png from: {asset_path}")
+        logger.info(f"Does overlay.png path exist? {os.path.exists(asset_path)}")
         if os.path.exists(asset_path):
             asset_img = Image.open(asset_path).convert("RGBA") # Load with alpha
             # Ensure asset is the correct size (optional, but good practice)
             if asset_img.size != (target_width, target_height):
-                logger.warning(f"asset1.png size {asset_img.size} does not match target {target_width}x{target_height}. Resizing.")
+                logger.warning(f"overlay.png size {asset_img.size} does not match target {target_width}x{target_height}. Resizing.")
                 asset_img = asset_img.resize((target_width, target_height), Image.Resampling.LANCZOS)
             # Paste asset covering the whole thumbnail at (0,0) using its alpha
             thumbnail.paste(asset_img, (0, 0), asset_img)
-            logger.info(f"Overlayed asset1.png at (0, 0)")
+            logger.info(f"Overlayed overlay.png at (0, 0)")
         else:
             logger.warning(f"Asset file not found at {asset_path}. Skipping overlay.")
     except FileNotFoundError:
-         logger.warning(f"Asset file 'assets/asset1.png' not found. Skipping overlay.")
+         logger.warning(f"Asset file 'assets/overlay.png' not found. Skipping overlay.")
     except Exception as asset_e:
-        logger.error(f"Could not load or place asset1.png: {asset_e}")
+        logger.error(f"Could not load or place overlay.png: {asset_e}")
 
 
     # Add player avatar using fetched user_data
@@ -803,6 +844,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
                  avatar_url = None # Indicate failure
 
         if avatar_url:
+            logger.info(f"Downloading avatar from: {avatar_url}")
             response = requests.get(avatar_url, timeout=10)
             response.raise_for_status()
             avatar_img = Image.open(BytesIO(response.content)).convert("RGBA") # Keep alpha for masking
@@ -833,49 +875,36 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
         "C:/Windows/Fonts/arialbd.ttf", # Arial Bold
         "C:/Windows/Fonts/arial.ttf" # Arial Regular
     ]
+    bold_font_paths = [
+        "C:/Windows/Fonts/arialbd.ttf", # Arial Bold first
+        resource_path(os.path.join("symbola", "Symbola.ttf")), # Fallback
+        "C:/Windows/Fonts/arialuni.ttf",
+        "C:/Windows/Fonts/seguiemj.ttf",
+        "C:/Windows/Fonts/arial.ttf"
+    ]
 
-    def find_font(paths, size):
-        # Check provided paths (already resolved by resource_path or absolute)
-        for path in paths:
-            try:
-                # Add logging before loading font
-                logger.info(f"Attempting to load font from: {path}")
-                logger.info(f"Does font path exist? {os.path.exists(path)}")
-                if os.path.exists(path):
-                    logger.info(f"Loading font: {path} with size {size}")
-                    return ImageFont.truetype(path, size)
-                else:
-                    logger.debug(f"Font path not found: {path}")
-            except IOError as e:
-                logger.warning(f"Could not load font {path} with size {size}: {e}")
 
-        logger.error(f"Could not find any suitable font in paths: {paths} for size {size}. Using default.")
-        return ImageFont.load_default(size) # Pass size to default loader
+    # Define INITIAL font sizes and MINIMUM sizes
+    initial_size_map_title = 140
+    min_size_map_title = 40
+    initial_size_difficulty = 70
+    min_size_difficulty = 30
+    size_username = 120
+    size_pp_stars = 115
+    size_acc_mods = 115
+    size_star_emoji = 80
+    size_fc_text = 300
+    size_rank_text = 180
 
-    # Define font sizes here for easy adjustment
-    # Modify these values to change the text sizes on the thumbnail
-    size_map_title = 160      # Size for the map title (top center)
-    size_difficulty = 70     # Size for the difficulty name (under title)
-    size_username = 120       # Size for the username (bottom center)
-    size_pp_stars = 115       # Size for PP (right of avatar) and Stars number (under PP)
-    size_acc_mods = 115       # Size for Accuracy (left of avatar) and Mods (under Accuracy)
-    size_star_emoji = 80      # Size for the star emoji (smaller than number)
-    size_fc_text = 300         # Size for the "FC" text
-
-    # Load fonts using the defined sizes
-    font_map_title = find_font(font_paths, size_map_title)
-    font_difficulty = find_font(font_paths, size_difficulty)
+    # Load fixed-size fonts
     font_username = find_font(font_paths, size_username)
     font_pp_stars = find_font(font_paths, size_pp_stars)
     font_acc_mods = find_font(font_paths, size_acc_mods)
     font_star_emoji = find_font(font_paths, size_star_emoji)
     font_fc = find_font(font_paths, size_fc_text)
+    font_rank = find_font(bold_font_paths, size_rank_text) # Try bold first
 
-    # Check if default font was loaded and log path if successful
-    if hasattr(font_map_title, 'path'): logger.info(f"Using font: {font_map_title.path} (map title)")
-    else: logger.warning("Using default PIL font (map title).")
-    if hasattr(font_difficulty, 'path'): logger.info(f"Using font: {font_difficulty.path} (difficulty)")
-    else: logger.warning("Using default PIL font (difficulty).")
+    # Log fixed-size font paths
     if hasattr(font_username, 'path'): logger.info(f"Using font: {font_username.path} (username)")
     else: logger.warning("Using default PIL font (username).")
     if hasattr(font_pp_stars, 'path'): logger.info(f"Using font: {font_pp_stars.path} (pp/stars)")
@@ -886,6 +915,8 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     else: logger.warning("Using default PIL font (star emoji).")
     if hasattr(font_fc, 'path'): logger.info(f"Using font: {font_fc.path} (FC text)")
     else: logger.warning("Using default PIL font (FC text).")
+    if hasattr(font_rank, 'path'): logger.info(f"Using font: {font_rank.path} (rank)")
+    else: logger.warning("Using default PIL font (rank).")
 
 
     # --- Find Beatmap ID and Fetch Score/PP/Mods/Rank ---
@@ -1047,49 +1078,110 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
 
     # --- Text Drawing ---
     text_color = (255, 255, 255)
-    outline_color = (0, 0, 0)
-    star_color = (255, 215, 0) # Gold color
+    outline_color = (0, 0, 0) # Used for non-rank text outline
+    star_color = (255, 215, 0) # Gold color for star emoji
     outline_width = 3
     center_x = target_width / 2
     top_margin = 30
     bottom_margin = 30
     side_spacing = 30
-    vertical_spacing = 60
-    horizontal_spacing_rank_mods = 40 # Spacing between rank image and mods text
+    vertical_spacing = 60 # Spacing between Acc/Mods and PP/Stars
+    vertical_spacing_title_diff = 10 # Smaller spacing between title and difficulty
+    horizontal_spacing_rank_mods = 40 # Spacing between rank text and mods text
     horizontal_spacing_star_num = 5 # Small gap between number and star emoji
     star_emoji_vertical_offset = 5 # Pixels to push emoji down relative to number's top
+    rank_glow_radius = 5 # Define glow radius for rank text
 
-    # 1. Map Title (Middle Top)
-    max_title_width = target_width * 0.9
-    truncated_title = truncate_text(song_title, font_map_title, max_title_width)
-    _, title_height = get_text_dimensions(font_map_title, truncated_title)
+    # Using RGBA for potential transparency in glow
+    RANK_BASE_COLORS = {
+        'D': (255, 0, 0, 255),      # Red
+        'C': (180, 0, 255, 255),    # Purple
+        'B': (0, 120, 255, 255),   # Blue
+        'A': (0, 255, 0, 255),      # Green
+        'S': (255, 215, 0, 255),    # Gold
+        'X': (255, 215, 0, 255),    # Gold
+    }
+    RANK_GLOW_COLORS = {
+        'D': (255, 100, 100, 180),  # Light Red
+        'C': (220, 100, 255, 180),  # Light Purple
+        'B': (100, 180, 255, 180),  # Light Blue
+        'A': (100, 255, 100, 180),  # Light Green
+        'S': (255, 235, 100, 180),  # Light Gold
+        'X': (255, 235, 100, 180),  # Light Gold
+    }
+    SILVER_BASE_COLOR = (192, 192, 192, 255) # Silver
+    SILVER_GLOW_COLOR = (230, 230, 230, 180) # Light Silver
+
+    # Define maximum widths for dynamic text areas
+    max_title_width = target_width / 2
+    max_diff_width = target_width / 2
+    max_username_width = target_width * 0.90 # Keep username width large for now
+
+    # 1. Map Title (Middle Top) - Adjust Font Size
+    font_map_title, title_width, title_height = adjust_font_size(
+        song_title,
+        initial_size_map_title,
+        font_paths,
+        max_title_width, # Use updated max width
+        min_size=min_size_map_title
+    )
     title_y = top_margin
-    draw_centered_text_with_outline(draw, center_x, title_y, truncated_title, font_map_title, text_color, outline_color, outline_width)
-    logger.info(f"Drew map title at ({center_x}, {title_y})")
+    # Use standard outline for title/difficulty/username
+    draw_centered_text_with_effect(draw, center_x, title_y, song_title, font_map_title, text_color,
+                                   effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
+    logger.info(f"Drew map title at ({center_x}, {title_y}) with adjusted font size {font_map_title.size} (Height: {title_height}, MaxWidth: {max_title_width})")
 
-    # 2. Difficulty Name (Under Map Title)
-    max_diff_width = target_width * 0.8
-    truncated_diff = truncate_text("[" + difficulty + "]", font_difficulty, max_diff_width)
-    _, diff_height = get_text_dimensions(font_difficulty, truncated_diff)
-    diff_y = title_y + title_height # Place directly under title
-    draw_centered_text_with_outline(draw, center_x, diff_y, truncated_diff, font_difficulty, text_color, outline_color, outline_width)
-    logger.info(f"Drew difficulty at ({center_x}, {diff_y})")
+    # 2. Difficulty Name (Under Map Title) - Adjust Font Size
+    difficulty_text = "[" + difficulty + "]"
+    font_difficulty, diff_width, diff_height = adjust_font_size(
+        difficulty_text,
+        initial_size_difficulty,
+        font_paths,
+        max_diff_width, # Use updated max width
+        min_size=min_size_difficulty
+    )
+    # Position difficulty based on the *actual* height of the adjusted title font
+    diff_y = title_y + title_height + vertical_spacing_title_diff
+    draw_centered_text_with_effect(draw, center_x, diff_y, difficulty_text, font_difficulty, text_color,
+                                   effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
+    logger.info(f"Drew difficulty at ({center_x}, {diff_y}) with adjusted font size {font_difficulty.size} (Height: {diff_height}, MaxWidth: {max_diff_width})")
 
-    # 3. Username (Middle Bottom)
-    max_username_width = target_width * 0.9
-    truncated_username = truncate_text(username, font_username, max_username_width)
-    _, username_height = get_text_dimensions(font_username, truncated_username)
+    # 3. Username (Middle Bottom) - Dynamic Size
+    font_username, username_width, username_height = adjust_font_size(
+        username,
+        size_username, # Use the original fixed size as the initial/max size
+        font_paths,
+        max_username_width,
+        min_size=40 # Set a minimum size for username
+    )
     username_y = target_height - bottom_margin - username_height
-    draw_centered_text_with_outline(draw, center_x, username_y, truncated_username, font_username, text_color, outline_color, outline_width)
-    logger.info(f"Drew username at ({center_x}, {username_y})")
+    draw_centered_text_with_effect(draw, center_x, username_y, username, font_username, text_color,
+                                   effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
+    logger.info(f"Drew username at ({center_x}, {username_y}) with adjusted font size {font_username.size} (Height: {username_height})")
 
-    # --- Calculate positions for left block (Acc, Mods) ---
+
+    # --- Calculate positions for left block (Acc, Mods, Rank) ---
     acc_text = accuracy_str
     acc_width, acc_height = get_text_dimensions(font_acc_mods, acc_text)
     mods_display_text = f"+{mods_str}" if mods_str != "NM" else "NM"
     mods_width, mods_height = get_text_dimensions(font_acc_mods, mods_display_text)
 
-    # Calculate total height of the Acc/Mods block
+    rank_text = rank[0] # Get the base letter (D, C, B, A, S, X)
+    is_hidden_rank = rank.endswith('H') # Check if it's SH or XH
+    use_silver = is_hidden_rank or (rank in ['S', 'X'] and Mods.Hidden in final_mods_enum)
+
+    if use_silver:
+        rank_base_color = SILVER_BASE_COLOR
+        rank_glow_color = SILVER_GLOW_COLOR
+        logger.info(f"Using Silver color scheme for rank '{rank}' (Hidden mod detected).")
+    else:
+        rank_base_color = RANK_BASE_COLORS.get(rank_text, (255, 255, 255, 255)) # Default white
+        rank_glow_color = RANK_GLOW_COLORS.get(rank_text, (200, 200, 200, 180)) # Default light gray glow
+        logger.info(f"Using {rank_text} color scheme for rank '{rank}'.")
+
+    rank_width, rank_height = get_text_dimensions(font_rank, rank_text)
+
+    # Calculate total height of the Acc/Mods block (Rank is drawn separately)
     total_left_block_height = acc_height + vertical_spacing + mods_height
 
     # Calculate base Y for the Accuracy/Mods block, centered on the reference point
@@ -1100,52 +1192,30 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
 
     # 4. Accuracy (Top of left block)
     acc_y = left_block_base_y
-    draw_right_aligned_text_with_outline(draw, left_x_end, acc_y, acc_text, font_acc_mods, text_color, outline_color, outline_width)
+    draw_right_aligned_text_with_effect(draw, left_x_end, acc_y, acc_text, font_acc_mods, text_color,
+                                        effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
     logger.info(f"Drew accuracy ending at ({left_x_end}, {acc_y})")
 
     # 5. Mods (Under Accuracy)
     mods_y = acc_y + acc_height + vertical_spacing
-    draw_right_aligned_text_with_outline(draw, left_x_end, mods_y, mods_display_text, font_acc_mods, text_color, outline_color, outline_width)
+    draw_right_aligned_text_with_effect(draw, left_x_end, mods_y, mods_display_text, font_acc_mods, text_color,
+                                        effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
     logger.info(f"Drew mods ending at ({left_x_end}, {mods_y})")
 
-    # --- Calculate and draw Rank Image ---
-    # Load Rank Image
-    rank_img = None
-    rank_image_width = 0
-    rank_image_height = 0
-    try:
-        rank_image_filename = f"ranking-{rank}@2x.png"
-        rank_image_path = resource_path(os.path.join("assets", "ranking", rank_image_filename))
-        logger.info(f"Attempting to load rank image from: {rank_image_path}")
-        logger.info(f"Does rank image path exist? {os.path.exists(rank_image_path)}")
-        if os.path.exists(rank_image_path):
-            rank_img_loaded = Image.open(rank_image_path).convert("RGBA")
-            desired_rank_height = int(size_acc_mods * 1.2) # Match height roughly with mods text
-            aspect_ratio = rank_img_loaded.width / rank_img_loaded.height
-            rank_image_width = int(desired_rank_height * aspect_ratio)
-            rank_image_height = desired_rank_height
-            rank_img = rank_img_loaded.resize((rank_image_width, rank_image_height), Image.Resampling.LANCZOS)
-            logger.info(f"Loaded and resized rank image: {rank_image_path}")
-        else:
-            logger.warning(f"Rank image not found: {rank_image_path}")
-    except FileNotFoundError:
-        logger.warning(f"Rank image file not found for rank '{rank}'.")
-    except Exception as e:
-        logger.error(f"Could not load or process rank image for rank '{rank}': {e}")
+    # Calculate Y position to align the bottom of rank text with the bottom of mods text
+    rank_y = mods_y + mods_height - rank_height # Align bottoms
 
-    # Position and Paste Rank Image (if loaded)
-    if rank_img:
-        # Calculate Y position to vertically align center with Mods text center
-        mods_center_y = mods_y + mods_height / 2
-        rank_y = mods_center_y - (rank_image_height / 2)
+    # Calculate X position to be left of Mods text
+    mods_x_start = left_x_end - mods_width
+    rank_x = mods_x_start - horizontal_spacing_rank_mods - rank_width
 
-        # Calculate X position to be left of Mods text
-        mods_x_start = left_x_end - mods_width
-        rank_x = mods_x_start - horizontal_spacing_rank_mods - rank_image_width
-
-        thumbnail.paste(rank_img, (int(rank_x), int(rank_y)), rank_img)
-        logger.info(f"Drew rank image at ({int(rank_x)}, {int(rank_y)})")
-
+    # Draw the rank text with glow
+    draw_text_with_effect(draw, (int(rank_x), int(rank_y)), rank_text, font_rank,
+                          fill=rank_base_color,
+                          effect_type='glow',
+                          effect_color=rank_glow_color,
+                          effect_radius=rank_glow_radius)
+    logger.info(f"Drew rank text '{rank_text}' with glow at ({int(rank_x)}, {int(rank_y)}) (Bottom aligned with mods)")
 
     # --- Calculate positions for right block (PP, Stars) ---
     pp_text = f"{pp:.0f}PP"
@@ -1161,7 +1231,8 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     pp_x = avatar_pos_x + avatar_size + side_spacing
 
     # 6. PP (Right of Avatar)
-    draw_text_with_outline(draw, (pp_x, pp_y), pp_text, font_pp_stars, text_color, outline_color, outline_width)
+    draw_text_with_effect(draw, (pp_x, pp_y), pp_text, font_pp_stars, text_color,
+                          effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
     logger.info(f"Drew PP at ({pp_x}, {pp_y})")
 
     # 7. Star Rating (Under PP)
@@ -1169,18 +1240,17 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     stars_x = avatar_pos_x + avatar_size + side_spacing # Align with PP
 
     # Draw star number
-    draw_text_with_outline(draw, (stars_x, stars_y), star_number_text, font_pp_stars, text_color, outline_color, outline_width)
+    draw_text_with_effect(draw, (stars_x, stars_y), star_number_text, font_pp_stars, text_color,
+                          effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
 
     # Calculate position for star emoji
     star_emoji_x = stars_x + star_number_width + horizontal_spacing_star_num
-    # --- CHANGE: Align emoji top relative to number top + offset ---
-    # star_number_center_y = stars_y + star_number_height / 2
-    # star_emoji_y = star_number_center_y - (star_emoji_height / 2) # Old center alignment
-    star_emoji_y = stars_y + star_emoji_vertical_offset # Align top + offset
-    # --- END CHANGE ---
+    # Align emoji top relative to number top + offset
+    star_emoji_y = stars_y + star_emoji_vertical_offset
 
-    # Draw star emoji
-    draw_text_with_outline(draw, (star_emoji_x, int(star_emoji_y)), star_emoji_text, font_star_emoji, star_color, outline_color, outline_width)
+    # Draw star emoji (using outline for consistency with other text)
+    draw_text_with_effect(draw, (star_emoji_x, int(star_emoji_y)), star_emoji_text, font_star_emoji, star_color,
+                          effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
     logger.info(f"Drew stars number at ({stars_x}, {stars_y}) and emoji at ({star_emoji_x}, {int(star_emoji_y)}) (using {star_emoji_vertical_offset}px vertical offset)")
 
     # --- Draw FC Text if applicable ---
@@ -1188,14 +1258,31 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
         fc_text = "FC"
         fc_pos_x = 50 # Left margin
         fc_pos_y = 30 # Top margin
-        # Use star_color for the fill color
-        draw_text_with_outline(draw, (fc_pos_x, fc_pos_y), fc_text, font_fc, star_color, outline_color, outline_width)
+        # Use star_color for the fill color, maybe add glow? Let's stick to outline for now.
+        draw_text_with_effect(draw, (fc_pos_x, fc_pos_y), fc_text, font_fc, star_color,
+                              effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
         logger.info(f"Drew FC text at ({fc_pos_x}, {fc_pos_y})")
 
-    # Save result
-    output_filename = "thumbnail.jpg"
-    thumbnail.save(output_filename, quality=95)
-    logger.info(f"Thumbnail saved successfully as {output_filename}")
+    # --- Save result ---
+    output_dir = "thumbnails"
+    # Create the directory if it doesn't exist
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Ensured output directory exists: {output_dir}")
+    except OSError as e:
+        logger.error(f"Could not create output directory '{output_dir}': {e}")
+        raise RuntimeError(f"Failed to create thumbnail directory: {e}") # Re-raise as runtime error
+
+    # Construct the full output path
+    base_filename = f"thumbnail_{code}.jpg"
+    output_filepath = os.path.join(output_dir, base_filename)
+
+    # Convert back to RGB before saving as JPG
+    thumbnail = thumbnail.convert("RGB")
+    thumbnail.save(output_filepath, quality=95)
+    logger.info(f"Thumbnail saved successfully as {output_filepath}")
+
+    return output_filepath # Return the full path
 
 
 def verify_credentials(client_id, client_secret):
@@ -1332,7 +1419,7 @@ class ThumbnailGeneratorGUI(QMainWindow):
         # --- Log Display Area ---
         self.log_display = QTextEdit()
         self.log_display.setReadOnly(True)
-        self.log_display.setLineWrapMode(QTextEdit.NoWrap)
+        self.log_display.setLineWrapMode(QTextEdit.NoWrap) # Keep NoWrap for better readability
 
         # --- Add widgets to main layout ---
         layout.addWidget(self.credential_widget)
@@ -1370,8 +1457,15 @@ class ThumbnailGeneratorGUI(QMainWindow):
         self.logger.info("Switched view to ORDR input.")
 
     def update_log_display(self, log_entry):
-        """Appends a log message to the QTextEdit. This runs in the main GUI thread."""
+        """Appends a log message to the QTextEdit and ensures it's visible. This runs in the main GUI thread."""
         self.log_display.append(log_entry)
+        # Ensure the latest log entry is visible by moving the cursor and scrollbar
+        cursor = self.log_display.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.log_display.setTextCursor(cursor)
+        # Optional: Force scrollbar to bottom if needed, append usually handles this
+        # self.log_display.verticalScrollBar().setValue(self.log_display.verticalScrollBar().maximum())
+
 
     def handle_action_button(self):
         """Handles clicks for the main button, switching between verify and generate."""
@@ -1389,7 +1483,7 @@ class ThumbnailGeneratorGUI(QMainWindow):
 
                 self.action_button.setEnabled(False)
                 self.action_button.setText("Verifying...")
-                QApplication.processEvents()
+                QApplication.processEvents() # Update button text
 
                 if verify_credentials(client_id, client_secret):
                     self.logger.info("Credentials verified successfully.")
@@ -1404,7 +1498,7 @@ class ThumbnailGeneratorGUI(QMainWindow):
                 else:
                     self.logger.warning("Verification failed: Invalid credentials.")
                     QMessageBox.warning(self, "Verification Failed", "Invalid API credentials. Please check and try again.")
-                    self.action_button.setText("Verify Credentials")
+                    self.action_button.setText("Verify Credentials") # Reset button text on failure
 
                 # Re-enable button
                 self.action_button.setEnabled(True)
@@ -1419,23 +1513,34 @@ class ThumbnailGeneratorGUI(QMainWindow):
                     QMessageBox.warning(self, "Input Required", "ORDR URL is required.")
                     return
 
+                # Disable button and update text *before* starting thread
                 self.action_button.setEnabled(False)
                 self.action_button.setText("Generating...")
-                QApplication.processEvents()
+                QApplication.processEvents() # Ensure button updates before potential blocking
 
                 client_id = self.client_id_input.text().strip()
                 client_secret = self.client_secret_input.text().strip()
 
                 # --- Setup and start worker thread ---
+                # Ensure previous thread is cleaned up if user clicks rapidly (shouldn't happen with button disabled)
+                if self.thread is not None and self.thread.isRunning():
+                    logger.warning("Previous worker thread still running? Attempting to wait...")
+                    self.thread.quit()
+                    self.thread.wait(1000) # Wait a bit
+
                 self.thread = QThread()
                 self.worker = Worker(ordr_url, client_id, client_secret)
                 self.worker.moveToThread(self.thread)
 
+                # Connections
                 self.worker.finished.connect(self.on_generation_complete)
                 self.thread.started.connect(self.worker.run)
+                # Cleanup connections
                 self.worker.finished.connect(self.thread.quit)
                 self.worker.finished.connect(self.worker.deleteLater)
                 self.thread.finished.connect(self.thread.deleteLater)
+                # Ensure thread object is cleared after it finishes
+                self.thread.finished.connect(self._clear_thread_ref)
 
                 self.logger.info("Starting worker thread...")
                 self.thread.start()
@@ -1445,38 +1550,81 @@ class ThumbnailGeneratorGUI(QMainWindow):
             self.logger.exception("Unexpected error in GUI action handler:")
             QMessageBox.critical(self, "GUI Error", f"An unexpected error occurred in the application:\n{str(e)}\n\nCheck the log window and thumbnail_generator.log for details.")
 
+            # Reset button state on error
             self.action_button.setEnabled(True)
             if self.ordr_widget.isHidden():
                 self.action_button.setText("Verify Credentials")
             else:
                 self.action_button.setText("Generate Thumbnail")
+            # Clear thread refs if an error occurred during setup
+            self.thread = None
+            self.worker = None
+
+    def _clear_thread_ref(self):
+        """Clear thread and worker references after thread finishes."""
+        logger.debug("Clearing thread and worker references.")
+        self.thread = None
+        self.worker = None
 
     def on_generation_complete(self, success, message):
         """Slot executed in the main GUI thread when the worker finishes."""
         self.logger.info(f"Generation complete signal received. Success: {success}")
-        self.action_button.setEnabled(True)
-        self.action_button.setText("Generate Thumbnail")
+        self.action_button.setEnabled(True) # Re-enable button
+        self.action_button.setText("Generate Thumbnail") # Reset button text
 
         if success:
             QMessageBox.information(self, "Success", message)
         else:
             QMessageBox.critical(self, "Generation Error", message)
 
-        self.thread = None
-        self.worker = None
+        # Note: Thread/worker cleanup is handled by connections to finished signals
         self.logger.info("GUI state updated after generation completion.")
 
     def closeEvent(self, event):
-        """Ensure thread is stopped if GUI is closed while running."""
+        """Ensure thread is stopped and log file is deleted if GUI is closed."""
+        # Stop worker thread first
         if self.thread is not None and self.thread.isRunning():
             logger.warning("Attempting to stop worker thread on close...")
+            # Disconnect signals to avoid issues during shutdown? Maybe not necessary.
+            try:
+                self.worker.finished.disconnect(self.on_generation_complete)
+                self.thread.started.disconnect(self.worker.run)
+                self.worker.finished.disconnect(self.thread.quit)
+                self.worker.finished.disconnect(self.worker.deleteLater)
+                self.thread.finished.disconnect(self.thread.deleteLater)
+                self.thread.finished.disconnect(self._clear_thread_ref)
+            except TypeError: # Signals might already be disconnected
+                pass
+            except Exception as e:
+                logger.error(f"Error disconnecting signals during close: {e}")
+
             self.thread.quit()
-            if not self.thread.wait(2000):
+            if not self.thread.wait(2000): # Wait up to 2 seconds
                  logger.warning("Worker thread did not stop gracefully, terminating.")
                  self.thread.terminate() # Force terminate if needed
                  self.thread.wait() # Wait for termination
             logger.info("Worker thread stopped.")
-        event.accept()
+
+        try:
+            # Remove the handler to release the file lock
+            logger.removeHandler(log_file_handler)
+            log_file_handler.close() # Explicitly close the handler
+            logger.info(f"Attempting to delete log file: {LOG_FILENAME}")
+            if os.path.exists(LOG_FILENAME):
+                os.remove(LOG_FILENAME)
+                # Cannot log success here as handler is removed
+                print(f"Successfully deleted log file: {LOG_FILENAME}") # Use print as fallback
+            else:
+                # Cannot log warning here
+                print(f"Log file not found, skipping deletion: {LOG_FILENAME}")
+        except PermissionError as e:
+             # Cannot log error here
+             print(f"Permission error deleting log file {LOG_FILENAME}: {e}")
+        except Exception as e:
+            # Cannot log error here
+            print(f"Error deleting log file {LOG_FILENAME}: {e}")
+
+        event.accept() # Accept the close event
 
 
 def main():
@@ -1507,11 +1655,14 @@ def main():
 
     # Setup PyQt Application
     app = QApplication(sys.argv)
-    # app.setStyle('Fusion')
+    # app.setStyle('Fusion') # Optional: Set style
     window = ThumbnailGeneratorGUI()
     window.show()
     logger.info("Application started.")
-    sys.exit(app.exec_())
+    exit_code = app.exec_()
+    # Ensure logging is shut down cleanly *before* sys.exit
+    logging.shutdown()
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()
