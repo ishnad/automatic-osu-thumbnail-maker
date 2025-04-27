@@ -70,16 +70,24 @@ class Worker(QObject):
 
     def run(self):
         """Runs the thumbnail creation task."""
+        logger.info("Worker thread run method started.")
         try:
-            logger.info("Worker thread started for thumbnail generation.")
+            logger.info("Calling create_thumbnail function...")
             output_filename = create_thumbnail(self.ordr_url, self.client_id, self.client_secret)
+            logger.info(f"create_thumbnail function finished successfully. Result: {output_filename}")
+            logger.info("Emitting finished signal (success=True)...")
             self.finished.emit(True, f"Thumbnail created successfully as {output_filename}!")
+            logger.info("Finished signal emitted.")
         except (ValueError, RuntimeError) as user_error:
             logger.error(f"Worker thread failed (User Error): {user_error}")
+            logger.info("Emitting finished signal (success=False, user error)...")
             self.finished.emit(False, f"{str(user_error)}")
+            logger.info("Finished signal emitted.")
         except Exception as e:
             logger.exception("Worker thread failed (Unexpected Error):") # Log full traceback
+            logger.info("Emitting finished signal (success=False, unexpected error)...")
             self.finished.emit(False, f"An unexpected error occurred:\n{str(e)}\n\nCheck logs for details.")
+            logger.info("Finished signal emitted.")
         finally:
             logger.info("Worker run method finished execution.")
 
@@ -340,10 +348,12 @@ def download_from_mirror(beatmapset_id: int, target_difficulty_name: str) -> Tup
     osu_file_path_found = None # Store the path to the target .osu file
 
     try:
-        logger.info(f"Attempting to download beatmapset {beatmapset_id} from mirror...")
+        logger.info(f"Attempting to download beatmapset {beatmapset_id} from mirror (beatconnect)...")
         # Add timeout to mirror request
         response = requests.get(f"https://beatconnect.io/b/{beatmapset_id}/", stream=True, timeout=30)
+        logger.debug(f"Mirror request status code: {response.status_code}")
         response.raise_for_status()
+        logger.info(f"Mirror download request successful for {beatmapset_id}.")
 
         osz_path = f"{beatmapset_id}.osz"
         with open(osz_path, "wb") as f:
@@ -483,13 +493,15 @@ def download_from_mirror(beatmapset_id: int, target_difficulty_name: str) -> Tup
     except Exception as e:
         logger.error(f"An unexpected error occurred during mirror download/extraction for {beatmapset_id}: {e}")
     finally:
+        time.sleep(0.01) # Yield time before cleanup
         # Clean up temp folder regardless of success/failure
         if os.path.exists(extract_folder):
+            logger.info(f"Attempting to clean up temporary folder: {extract_folder}")
             max_retries = 3
             for i in range(max_retries):
                 try:
                     shutil.rmtree(extract_folder)
-                    logger.info(f"Cleaned up temporary folder: {extract_folder}")
+                    logger.info(f"Successfully cleaned up temporary folder: {extract_folder}")
                     break
                 except PermissionError as e:
                      logger.warning(f"PermissionError cleaning up {extract_folder} (attempt {i+1}/{max_retries}): {e}. Retrying...")
@@ -774,16 +786,22 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     """Create osu! thumbnail from ORDR render link.
        Returns the filename of the created thumbnail.
     """
+    logger.info("--- Starting create_thumbnail function ---")
     # No try/except block here - let the caller (Worker.run) handle exceptions
     if not ordr_url:
         logger.error("ORDR URL is required but was not provided.")
         raise ValueError("ORDR URL is required")
 
     logger.info(f"Generating thumbnail from ORDR URL: {ordr_url}")
+    logger.info("Extracting ORDR code...")
     code = extract_ordr_code(ordr_url) # Capture code for filename
+    logger.info("Fetching ORDR metadata...")
     meta = fetch_ordr_metadata(code)
+    logger.info("ORDR metadata fetched.")
+    time.sleep(0.01) # Yield time
 
     # Extract fields from metadata
+    logger.info("Extracting data from ORDR metadata...")
     username = meta.get("replayUsername", "Unknown Player")
     song_title = meta.get("mapTitle", "Unknown Song")
     difficulty = meta.get("replayDifficulty", "Unknown Difficulty") # Keep original case for display
@@ -830,23 +848,34 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
 
     # Fetch API data if credentials provided
     if client_id and client_secret:
+        logger.info("API credentials provided. Attempting to fetch API data.")
         try:
+            logger.info("Getting API access token...")
             token = get_access_token(client_id, client_secret)
+            logger.info("Access token obtained.")
             # Fetch beatmapset details (needed for difficulty ID and potentially background)
             logger.info(f"Fetching beatmapset data for set ID: {beatmapset_id}")
             beatmapset_data = make_api_request(token, f"beatmapsets/{beatmapset_id}")
+            logger.info("Beatmapset data fetched.")
             # Fetch user details (needed for user ID and avatar)
             logger.info(f"Fetching user data for username: {username}")
             # URL encode username just in case it has special characters
             encoded_username = requests.utils.quote(username)
             user_data = make_api_request(token, f"users/{encoded_username}/osu")
+            logger.info("User data fetched.")
+            time.sleep(0.01) # Yield time
         except Exception as e:
             logger.warning(f"Failed to fetch initial API data: {e}. Proceeding with limited info.")
             # Continue without API data if possible, features like PP/Avatar/API Mods/Modded Stars might fail
+            time.sleep(0.01) # Yield time even on failure
+    else:
+        logger.info("API credentials not provided. Skipping API data fetch.")
 
     # Get background image AND .osu file content: Try mirror first, then API for background only
-    logger.info(f"Attempting to get background and .osu content for beatmapset ID: {beatmapset_id}, Difficulty: '{target_difficulty_name_ordr}'")
+    logger.info(f"Attempting to get background and .osu content via mirror for beatmapset ID: {beatmapset_id}, Difficulty: '{target_difficulty_name_ordr}'")
     bg_image, osu_file_content = download_from_mirror(beatmapset_id, target_difficulty_name_ordr)
+    logger.info("Mirror download attempt finished.")
+    time.sleep(0.01) # Yield time
 
     if osu_file_content:
         logger.info(f"Successfully obtained .osu file content for '{target_difficulty_name_ordr}' from mirror.")
@@ -859,10 +888,12 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
         # Prefer cover@2x for higher resolution, fallback to cover
         bg_url = covers.get("cover@2x") or covers.get("cover")
         if bg_url:
-            logger.info("Using background from osu! API (fallback)")
+            logger.info(f"Using background from osu! API (fallback): {bg_url}")
             try:
+                logger.debug("Downloading API background...")
                 response = requests.get(bg_url, timeout=15)
                 response.raise_for_status()
+                logger.debug("API background downloaded. Processing image...")
                 bg_image = Image.open(BytesIO(response.content)).convert('RGB') # Ensure RGB
                 logger.info("Successfully loaded background from osu! API.")
             except requests.exceptions.RequestException as e:
@@ -875,11 +906,13 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
         raise ValueError("Could not obtain background image")
 
     # Create thumbnail base
+    logger.info("Processing background image for thumbnail base...")
     bg_width, bg_height = bg_image.size
     target_width, target_height = 1920, 1080
     logger.info(f"Background size: {bg_width}x{bg_height}. Target size: {target_width}x{target_height}")
 
     # Calculate scaling to fill the target aspect ratio, then crop
+    logger.debug("Calculating background scaling and cropping...")
     bg_aspect = bg_width / bg_height
     target_aspect = target_width / target_height
 
@@ -907,11 +940,13 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     logger.info("Created base thumbnail canvas and processed background.")
 
     # Apply blur to the base thumbnail
+    logger.info("Applying blur...")
     blur_radius = 5 # Adjust this value for more/less blur
     thumbnail_blurred = thumbnail_base.filter(ImageFilter.GaussianBlur(radius=blur_radius))
     logger.info(f"Applied Gaussian blur with radius {blur_radius} to background.")
 
     # Apply dimming
+    logger.info("Applying dimming...")
     thumbnail_blurred = thumbnail_blurred.convert("RGBA") # Ensure RGBA for compositing
     dim_alpha = 100 # Adjust 0-255 for less/more dimming (e.g., 100 is moderate)
     dim_layer = Image.new('RGBA', thumbnail_blurred.size, (0, 0, 0, 0)) # Transparent layer
@@ -923,9 +958,11 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     # Re-initialize Draw object on the dimmed and blurred image
     # Draw needs RGBA for alpha compositing of glow/rank
     # thumbnail is already RGBA after alpha_composite
+    logger.debug("Initializing ImageDraw object...")
     draw = ImageDraw.Draw(thumbnail)
 
     # Add overlay.png overlay FIRST (after blur/dim, before other elements)
+    logger.info("Attempting to add overlay.png...")
     try:
         asset_path = resource_path(os.path.join("assets", "overlay.png"))
         # Add logging before loading overlay.png
@@ -938,6 +975,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
                 logger.warning(f"overlay.png size {asset_img.size} does not match target {target_width}x{target_height}. Resizing.")
                 asset_img = asset_img.resize((target_width, target_height), Image.Resampling.LANCZOS)
             # Paste asset covering the whole thumbnail at (0,0) using its alpha
+            logger.debug("Pasting overlay image...")
             thumbnail.paste(asset_img, (0, 0), asset_img)
             logger.info(f"Overlayed overlay.png at (0, 0)")
         else:
@@ -946,9 +984,12 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
          logger.warning(f"Asset file 'assets/overlay.png' not found. Skipping overlay.")
     except Exception as asset_e:
         logger.error(f"Could not load or place overlay.png: {asset_e}")
+    logger.info("Overlay step finished.")
+    time.sleep(0.01) # Yield time
 
 
     # Add player avatar using fetched user_data
+    logger.info("Attempting to add player avatar...")
     avatar_url = None
     user_id = None # Keep track of user ID for PP fetch
     avatar_size = 450 # Define default size (increased from 150)
@@ -1000,6 +1041,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
             draw_mask.ellipse((0, 0, avatar_size, avatar_size), fill=255)
 
             # Paste avatar at the calculated position
+            logger.debug("Pasting avatar image with mask...")
             thumbnail.paste(avatar_img, avatar_pos, mask) # Use mask for transparency
             logger.info(f"Added player avatar at {avatar_pos} (center)")
 
@@ -1008,26 +1050,19 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
 
     except Exception as e:
         logger.error(f"Couldn't load or place player avatar: {e}")
+    logger.info("Avatar step finished.")
+    time.sleep(0.01) # Yield time
 
 
     # --- Font Setup ---
+    logger.info("Setting up fonts...")
     # Prioritize Symbola/Segoe UI Symbol for special characters, fallback for others
     font_paths = [
         "C:/Windows/Fonts/seguiemj.ttf", # Segoe UI Emoji (Windows)
-        # resource_path(os.path.join("symbola", "Symbola.ttf")),
-        # "C:/Windows/Fonts/arialuni.ttf", # Arial Unicode MS (common fallback)
-        # "C:/Windows/Fonts/seguisym.ttf", # Segoe UI Symbol (often has solid star)
-        # "C:/Windows/Fonts/arialbd.ttf", # Arial Bold
-        # "C:/Windows/Fonts/arial.ttf" # Arial Regular
     ]
     bold_font_paths = [
         "C:/Windows/Fonts/arialbd.ttf", # Arial Bold first
-        # resource_path(os.path.join("symbola", "Symbola.ttf")), # Fallback
-        # "C:/Windows/Fonts/arialuni.ttf",
-        # "C:/Windows/Fonts/seguiemj.ttf",
-        # "C:/Windows/Fonts/arial.ttf"
     ]
-
 
     # Define INITIAL font sizes and MINIMUM sizes
     initial_size_map_title = 140
@@ -1043,11 +1078,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
 
     # Define specific font paths for the star emoji (now U+2605), prioritizing Segoe UI Symbol and Symbola
     star_emoji_font_paths = [
-        # "C:/Windows/Fonts/seguiemj.ttf", # Segoe UI Emoji (less likely for U+2605)
         "C:/Windows/Fonts/seguisym.ttf", # Segoe UI Symbol (often has solid U+2605)
-        # resource_path(os.path.join("symbola", "Symbola.ttf")), # Bundled Symbola (good fallback)
-        # resource_path(os.path.join("assets", "fonts", "NotoSansSymbols2-Regular.ttf")), # Noto (might work)
-        # "C:/Windows/Fonts/arialuni.ttf", # Arial Unicode MS (fallback)
     ]
 
     # Load fixed-size fonts
@@ -1074,15 +1105,20 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     else: logger.warning("Using default PIL font (rank).")
 
 
+    logger.info("Font setup finished.")
+
     # --- Find Beatmap ID and Fetch Score/PP/Mods/Rank ---
+    logger.info("Attempting to find beatmap ID and fetch score/rank/mods/stars...")
     # Note: mods_str and final_mods_enum are initialized using ORDR data as a fallback.
     if token and user_id and beatmapset_data: # Check if we have API token, user ID, and beatmapset data
+        logger.info("API token, user ID, and beatmapset data available. Proceeding with API lookups.")
         try:
             # Use the difficulty name from ORDR metadata for matching
             target_difficulty_name_api = meta.get('replayDifficulty', '')
             logger.info(f"Attempting to find beatmap ID for difficulty: '{target_difficulty_name_api}' in set {beatmapset_id}")
 
             # Find the beatmap ID for the specific difficulty within the set
+            logger.debug("Iterating through beatmapset difficulties...")
             found_map = False
             base_stars_from_api = 0.0 # Store base star rating from API beatmap data
             for beatmap in beatmapset_data.get('beatmaps', []):
@@ -1143,11 +1179,13 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
 
             if found_map and beatmap_id:
                 # --- Fetch User's Best Score on the Map ---
-                logger.info(f"Fetching score details for user {user_id} on beatmap {beatmap_id} (for PP, Mods, Rank, FC override)")
+                logger.info(f"Beatmap ID found ({beatmap_id}). Fetching score details for user {user_id}...")
                 score_data = make_api_request(token, f"beatmaps/{beatmap_id}/scores/users/{user_id}")
                 score_info = score_data.get("score")
                 if score_info:
+                    logger.info("Score data found via API.")
                     # Get actual PP achieved in the score
+                    logger.debug("Extracting PP, Rank, Stats, Mods from score data...")
                     fetched_pp_val = score_info.get("pp")
                     if fetched_pp_val is not None:
                         fetched_pp = float(fetched_pp_val)
@@ -1211,6 +1249,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
                             logger.info(f"Combo check inconclusive ({', '.join(reason)}). Attempting PP comparison for FC check using rosu-pp-py.")
 
                             # 2. Try calculating theoretical PP for an FC with this accuracy/mods using exact hit counts
+                            logger.info("Calling get_theoretical_pp for FC check...")
                             theoretical_pp = get_theoretical_pp(
                                 osu_file_content=osu_file_content, # Use the fetched content
                                 mods_enum=final_mods_enum, # Use the final mods
@@ -1265,12 +1304,15 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
 
                 # --- Fetch Modded Star Rating ---
                 # Requires beatmap_id and the final_mods_enum determined above
+                logger.info("Attempting to fetch modded star rating...")
                 try:
                     logger.info(f"Fetching difficulty attributes for beatmap {beatmap_id} with mods enum: {final_mods_enum}")
                     attributes_payload = {"mods": final_mods_enum}
                     attributes_data = make_api_request(token, f"beatmaps/{beatmap_id}/attributes", method='POST', payload=attributes_payload)
+                    logger.debug("Difficulty attributes response received.")
                     modded_stars_value = attributes_data.get("attributes", {}).get("star_rating")
                     if modded_stars_value is not None:
+                        logger.debug(f"Modded stars found in response: {modded_stars_value}")
                         stars = float(modded_stars_value)
                         stars_str = f"{stars:.2f}"
                         stars_source = "osu! API Attributes (Modded)"
@@ -1300,10 +1342,13 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
          rank = 'D' # Default rank
          is_true_fc = False # Default True FC
          # Keep mods_str, final_mods_enum, stars, stars_str from earlier steps
+    logger.info("Finished fetching/determining score/rank/mods/stars.")
+    time.sleep(0.01) # Yield time
 
     logger.info(f"Final values - PP: {fetched_pp:.2f}, Mods: {mods_str} (Source: {mods_source}, Enum: {final_mods_enum}), Rank: {rank}, True FC (0 Miss + PP/Combo Check): {is_true_fc}, Stars: {stars_str} (Source: {stars_source})")
 
     # --- Text Drawing ---
+    logger.info("Starting text drawing phase...")
     text_color = (255, 255, 255)
     outline_color = (0, 0, 0) # Used for non-rank text outline
     star_color = (255, 215, 0) # Gold color for star emoji
@@ -1316,7 +1361,6 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     vertical_spacing_title_diff = 10 # Smaller spacing between title and difficulty
     horizontal_spacing_rank_mods = 40 # Spacing between rank text and mods text
     horizontal_spacing_star_num = 5 # Small gap between number and star emoji
-    # star_emoji_vertical_offset removed - will calculate alignment based on heights
     rank_glow_radius = 6 # Increased glow radius for Rank neon effect
     fc_glow_radius = 7 # Increased glow radius for FC neon effect
 
@@ -1347,6 +1391,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     max_username_width = target_width * 0.90 # Keep username width large for now
 
     # 1. Map Title (Middle Top) - Adjust Font Size
+    logger.info("Drawing map title...")
     font_map_title, title_width, title_height = adjust_font_size(
         song_title,
         initial_size_map_title,
@@ -1361,6 +1406,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     logger.info(f"Drew map title at ({center_x}, {title_y}) with adjusted font size {font_map_title.size} (Height: {title_height}, MaxWidth: {max_title_width})")
 
     # 2. Difficulty Name (Under Map Title) - Adjust Font Size
+    logger.info("Drawing difficulty name...")
     # Use the 'difficulty' variable which might have been updated by the star rating fallback match
     difficulty_text = "[" + difficulty + "]"
     font_difficulty, diff_width, diff_height = adjust_font_size(
@@ -1377,6 +1423,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     logger.info(f"Drew difficulty at ({center_x}, {diff_y}) with adjusted font size {font_difficulty.size} (Height: {diff_height}, MaxWidth: {max_diff_width})")
 
     # 3. Username (Middle Bottom) - Dynamic Size
+    logger.info("Drawing username...")
     font_username, username_width, username_height = adjust_font_size(
         username,
         size_username, # Use the original fixed size as the initial/max size
@@ -1422,17 +1469,21 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     left_x_end = avatar_pos_x - side_spacing
 
     # 4. Accuracy (Top of left block)
+    logger.info("Drawing accuracy...")
     acc_y = left_block_base_y
     draw_right_aligned_text_with_effect(draw, left_x_end, acc_y, acc_text, font_acc_mods, text_color,
                                         effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
     logger.info(f"Drew accuracy ending at ({left_x_end}, {acc_y})")
 
     # 5. Mods (Under Accuracy)
+    logger.info("Drawing mods...")
     mods_y = acc_y + acc_height + vertical_spacing
     draw_right_aligned_text_with_effect(draw, left_x_end, mods_y, mods_display_text, font_acc_mods, text_color,
                                         effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
     logger.info(f"Drew mods ending at ({left_x_end}, {mods_y})")
 
+    # 6. Rank (Left of Mods)
+    logger.info("Drawing rank...")
     # Calculate Y position to align the bottom of rank text with the bottom of mods text
     rank_y = mods_y + mods_height - rank_height # Align bottoms
 
@@ -1461,12 +1512,14 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     pp_y = pp_stars_base_y
     pp_x = avatar_pos_x + avatar_size + side_spacing
 
-    # 6. PP (Right of Avatar)
+    # 7. PP (Right of Avatar)
+    logger.info("Drawing PP...")
     draw_text_with_effect(draw, (pp_x, pp_y), pp_text, font_pp_stars, text_color,
                           effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
     logger.info(f"Drew PP at ({pp_x}, {pp_y})")
 
-    # 7. Star Rating (Under PP)
+    # 8. Star Rating (Under PP)
+    logger.info("Drawing star rating...")
     stars_y = pp_y + pp_height + vertical_spacing
     stars_x = avatar_pos_x + avatar_size + side_spacing # Align with PP
 
@@ -1486,7 +1539,9 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     logger.info(f"Drew stars number at ({stars_x}, {stars_y}) and emoji at ({star_emoji_x}, {int(star_emoji_y)}) (aligned top + {star_emoji_vertical_adjust}px adjustment)")
 
     # --- Draw FC Text if applicable (based on 0 misses AND PP/combo check) ---
+    logger.info("Checking if FC text should be drawn...")
     if is_true_fc: # Use the result of the PP comparison or combo fallback
+        logger.info("Drawing FC text...")
         fc_text = "FC"
         fc_pos_x = 50 # Left margin
         fc_pos_y = 30 # Top margin
@@ -1501,12 +1556,17 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
         logger.info("Skipping FC text because True FC conditions were not met (misses > 0 or PP/combo check failed).")
 
 
+    logger.info("Text drawing phase finished.")
+    time.sleep(0.01) # Yield time
+
     # --- Save result ---
+    logger.info("Saving final thumbnail image...")
     output_dir = "thumbnails"
     # Create the directory if it doesn't exist
     try:
+        logger.debug(f"Ensuring output directory exists: {output_dir}")
         os.makedirs(output_dir, exist_ok=True)
-        logger.info(f"Ensured output directory exists: {output_dir}")
+        logger.info(f"Output directory exists: {output_dir}")
     except OSError as e:
         logger.error(f"Could not create output directory '{output_dir}': {e}")
         raise RuntimeError(f"Failed to create thumbnail directory: {e}") # Re-raise as runtime error
@@ -1514,12 +1574,16 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     # Construct the full output path
     base_filename = f"thumbnail_{code}.jpg"
     output_filepath = os.path.join(output_dir, base_filename)
+    logger.debug(f"Output file path: {output_filepath}")
 
     # Convert back to RGB before saving as JPG
+    logger.debug("Converting image to RGB for saving...")
     thumbnail = thumbnail.convert("RGB")
+    logger.debug("Saving image...")
     thumbnail.save(output_filepath, quality=95)
     logger.info(f"Thumbnail saved successfully as {output_filepath}")
 
+    logger.info("--- Finished create_thumbnail function ---")
     return output_filepath # Return the full path
 
 
@@ -1668,9 +1732,10 @@ class ThumbnailGeneratorGUI(QMainWindow):
 
         # --- Setup GUI Log Handler ---
         self.log_handler = QtLogHandler()
+        self.log_handler.setLevel(logging.INFO) # Only show INFO and above in GUI
         self.log_handler.log_signal.connect(self.update_log_display)
         self.logger.addHandler(self.log_handler)
-        self.logger.info("GUI Log Handler configured.")
+        self.logger.info("GUI Log Handler configured (Level: INFO).")
 
         # --- Initial State ---
         self.ordr_widget.hide()
@@ -1782,6 +1847,7 @@ class ThumbnailGeneratorGUI(QMainWindow):
 
                 self.logger.info("Starting worker thread...")
                 self.thread.start()
+                self.logger.info("Worker thread start command issued.")
 
         except Exception as e:
             # Catch-all for unexpected errors in the handler logic itself
@@ -1806,7 +1872,8 @@ class ThumbnailGeneratorGUI(QMainWindow):
 
     def on_generation_complete(self, success, message):
         """Slot executed in the main GUI thread when the worker finishes."""
-        self.logger.info(f"Generation complete signal received. Success: {success}")
+        self.logger.info("--- on_generation_complete slot entered ---")
+        self.logger.info(f"Generation complete signal received. Success: {success}, Message: {message}")
         self.action_button.setEnabled(True) # Re-enable button
         self.action_button.setText("Generate Thumbnail") # Reset button text
 
@@ -1820,10 +1887,12 @@ class ThumbnailGeneratorGUI(QMainWindow):
 
     def closeEvent(self, event):
         """Ensure thread is stopped and log file is deleted if GUI is closed."""
+        logger.info("--- closeEvent triggered ---")
         # Stop worker thread first
         if self.thread is not None and self.thread.isRunning():
-            logger.warning("Attempting to stop worker thread on close...")
+            logger.warning("Worker thread is running. Attempting to stop worker thread on close...")
             # Disconnect signals to avoid issues during shutdown? Maybe not necessary.
+            logger.debug("Disconnecting worker/thread signals...")
             try:
                 self.worker.finished.disconnect(self.on_generation_complete)
                 self.thread.started.disconnect(self.worker.run)
@@ -1835,16 +1904,27 @@ class ThumbnailGeneratorGUI(QMainWindow):
                 pass
             except Exception as e:
                 logger.error(f"Error disconnecting signals during close: {e}")
+            logger.debug("Signals disconnected.")
 
+            logger.info("Requesting thread quit...")
             self.thread.quit()
+            logger.info("Waiting for thread to finish (max 2 seconds)...")
             if not self.thread.wait(2000): # Wait up to 2 seconds
-                 logger.warning("Worker thread did not stop gracefully, terminating.")
+                 logger.warning("Worker thread did not stop gracefully after quit(). Terminating.")
                  self.thread.terminate() # Force terminate if needed
+                 logger.info("Waiting for thread termination...")
                  self.thread.wait() # Wait for termination
-            logger.info("Worker thread stopped.")
+                 logger.info("Thread terminated.")
+            else:
+                logger.info("Worker thread stopped gracefully.")
+        # Note: The 'else' for the 'if self.thread...' check was missing in the provided file,
+        # so this 'try' block directly follows the 'if' block's scope.
+        # If the thread wasn't running, this 'try' block is reached immediately after the 'if' condition check.
 
+        logger.info("Attempting to close log handler and delete log file...")
         try:
             # Remove the handler to release the file lock
+            logger.info(f"Removing log handler for {LOG_FILENAME}")
             logger.removeHandler(log_file_handler)
             log_file_handler.close() # Explicitly close the handler
             logger.info(f"Attempting to delete log file: {LOG_FILENAME}")
