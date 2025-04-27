@@ -843,6 +843,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     mods_source = "ORDR Enum" # Track where the final mods came from
     rank = 'D' # Default rank
     is_true_fc = False # Default "True FC" status (0 misses AND 0 slider breaks, verified by PP check or combo check)
+    is_global_first = False # Default global #1 status
     api_mods_list = None # Store mods list from API score if available
     osu_file_content = None # Store content of the .osu file
 
@@ -1075,6 +1076,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     size_star_emoji = 140
     size_fc_text = 300
     size_rank_text = 180
+    size_rank_one_text = size_pp_stars # Match PP/Stars font size
 
     # Define specific font paths for the star emoji (now U+2605), prioritizing Segoe UI Symbol and Symbola
     star_emoji_font_paths = [
@@ -1089,6 +1091,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     font_star_emoji = find_font(star_emoji_font_paths, size_star_emoji)
     font_fc = find_font(font_paths, size_fc_text)
     font_rank = find_font(bold_font_paths, size_rank_text) # Try bold first
+    # font_rank_one is no longer needed, will use font_pp_stars
 
     # Log fixed-size font paths
     if hasattr(font_username, 'path'): logger.info(f"Using font: {font_username.path} (username)")
@@ -1103,6 +1106,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     else: logger.warning("Using default PIL font (FC text).")
     if hasattr(font_rank, 'path'): logger.info(f"Using font: {font_rank.path} (rank)")
     else: logger.warning("Using default PIL font (rank).")
+    # Removed logging for font_rank_one
 
 
     logger.info("Font setup finished.")
@@ -1295,8 +1299,26 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
                     api_perfect_flag = score_info.get("perfect", False)
                     logger.info(f"API 'perfect' flag value (for info only): {api_perfect_flag}")
 
+                    # --- Check if this score is Global #1 ---
+                    logger.info(f"Checking global leaderboard for beatmap {beatmap_id}...")
+                    try:
+                        global_scores_data = make_api_request(token, f"beatmaps/{beatmap_id}/scores")
+                        if global_scores_data and global_scores_data.get("scores"):
+                            top_score = global_scores_data["scores"][0]
+                            top_user_id = top_score.get("user_id")
+                            logger.info(f"Global #1 user ID: {top_user_id}. Current user ID: {user_id}")
+                            if top_user_id == user_id:
+                                is_global_first = True
+                                logger.info("Confirmed: This score is Global #1!")
+                            else:
+                                logger.info("This score is not Global #1.")
+                        else:
+                            logger.warning("No scores found on global leaderboard or empty response.")
+                    except Exception as global_e:
+                        logger.error(f"Failed to fetch or process global leaderboard: {global_e}")
+
                 else: # This else corresponds to 'if score_info:'
-                    logger.warning(f"Score not found via API for user {user_id} on beatmap {beatmap_id}. PP set to 0. Rank set to D. True FC status unknown. Using mods from ORDR enum ('{mods_str}', enum {final_mods_enum}).")
+                    logger.warning(f"Score not found via API for user {user_id} on beatmap {beatmap_id}. PP set to 0. Rank set to D. True FC status unknown. Global #1 status unknown. Using mods from ORDR enum ('{mods_str}', enum {final_mods_enum}).")
                     fetched_pp = 0.0 # Reset PP if score not found
                     rank = 'D'
                     is_true_fc = False # Assume not True FC if score not found
@@ -1345,7 +1367,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     logger.info("Finished fetching/determining score/rank/mods/stars.")
     time.sleep(0.01) # Yield time
 
-    logger.info(f"Final values - PP: {fetched_pp:.2f}, Mods: {mods_str} (Source: {mods_source}, Enum: {final_mods_enum}), Rank: {rank}, True FC (0 Miss + PP/Combo Check): {is_true_fc}, Stars: {stars_str} (Source: {stars_source})")
+    logger.info(f"Final values - PP: {fetched_pp:.2f}, Mods: {mods_str} (Source: {mods_source}, Enum: {final_mods_enum}), Rank: {rank}, True FC: {is_true_fc}, Global #1: {is_global_first}, Stars: {stars_str} (Source: {stars_source})")
 
     # --- Text Drawing ---
     logger.info("Starting text drawing phase...")
@@ -1537,6 +1559,26 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     draw_text_with_effect(draw, (star_emoji_x, int(star_emoji_y)), star_emoji_text, font_star_emoji, star_color,
                           effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
     logger.info(f"Drew stars number at ({stars_x}, {stars_y}) and emoji at ({star_emoji_x}, {int(star_emoji_y)}) (aligned top + {star_emoji_vertical_adjust}px adjustment)")
+
+    # 9. Draw #1 indicator if applicable (below stars)
+    logger.info("Checking if #1 indicator should be drawn...")
+    if is_global_first:
+        logger.info("Drawing #1 indicator...")
+        rank_one_text = "#1"
+        # Use the same font as PP/Stars
+        rank_one_font = font_pp_stars
+        rank_one_width, rank_one_height = get_text_dimensions(rank_one_font, rank_one_text)
+        # Position below the star line using the standard vertical_spacing
+        rank_one_y = stars_y + max(star_number_height, star_emoji_height) + vertical_spacing # Use standard spacing
+        rank_one_x = stars_x # Align with the start of the star number text
+
+        # Use the standard text_color (white) and outline effect
+        draw_text_with_effect(draw, (rank_one_x, rank_one_y), rank_one_text, rank_one_font, text_color,
+                              effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
+        logger.info(f"Drew #1 indicator at ({rank_one_x}, {rank_one_y}) using PP/Stars font and spacing.")
+    else:
+        logger.info("Skipping #1 indicator because score is not global first.")
+
 
     # --- Draw FC Text if applicable (based on 0 misses AND PP/combo check) ---
     logger.info("Checking if FC text should be drawn...")
