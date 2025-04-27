@@ -1011,20 +1011,21 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
 
 
     # --- Font Setup ---
-    # Prioritize Symbola for special characters, fallback for others
+    # Prioritize Symbola/Segoe UI Symbol for special characters, fallback for others
     font_paths = [
-        resource_path(os.path.join("symbola", "Symbola.ttf")),
-        "C:/Windows/Fonts/arialuni.ttf", # Arial Unicode MS (common fallback)
         "C:/Windows/Fonts/seguiemj.ttf", # Segoe UI Emoji (Windows)
-        "C:/Windows/Fonts/arialbd.ttf", # Arial Bold
-        "C:/Windows/Fonts/arial.ttf" # Arial Regular
+        # resource_path(os.path.join("symbola", "Symbola.ttf")),
+        # "C:/Windows/Fonts/arialuni.ttf", # Arial Unicode MS (common fallback)
+        # "C:/Windows/Fonts/seguisym.ttf", # Segoe UI Symbol (often has solid star)
+        # "C:/Windows/Fonts/arialbd.ttf", # Arial Bold
+        # "C:/Windows/Fonts/arial.ttf" # Arial Regular
     ]
     bold_font_paths = [
         "C:/Windows/Fonts/arialbd.ttf", # Arial Bold first
-        resource_path(os.path.join("symbola", "Symbola.ttf")), # Fallback
-        "C:/Windows/Fonts/arialuni.ttf",
-        "C:/Windows/Fonts/seguiemj.ttf",
-        "C:/Windows/Fonts/arial.ttf"
+        # resource_path(os.path.join("symbola", "Symbola.ttf")), # Fallback
+        # "C:/Windows/Fonts/arialuni.ttf",
+        # "C:/Windows/Fonts/seguiemj.ttf",
+        # "C:/Windows/Fonts/arial.ttf"
     ]
 
 
@@ -1036,15 +1037,25 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     size_username = 120
     size_pp_stars = 115
     size_acc_mods = 115
-    size_star_emoji = 80
+    size_star_emoji = 140
     size_fc_text = 300
     size_rank_text = 180
+
+    # Define specific font paths for the star emoji (now U+2605), prioritizing Segoe UI Symbol and Symbola
+    star_emoji_font_paths = [
+        # "C:/Windows/Fonts/seguiemj.ttf", # Segoe UI Emoji (less likely for U+2605)
+        "C:/Windows/Fonts/seguisym.ttf", # Segoe UI Symbol (often has solid U+2605)
+        # resource_path(os.path.join("symbola", "Symbola.ttf")), # Bundled Symbola (good fallback)
+        # resource_path(os.path.join("assets", "fonts", "NotoSansSymbols2-Regular.ttf")), # Noto (might work)
+        # "C:/Windows/Fonts/arialuni.ttf", # Arial Unicode MS (fallback)
+    ]
 
     # Load fixed-size fonts
     font_username = find_font(font_paths, size_username)
     font_pp_stars = find_font(font_paths, size_pp_stars)
     font_acc_mods = find_font(font_paths, size_acc_mods)
-    font_star_emoji = find_font(font_paths, size_star_emoji)
+    # Use the dedicated path list for the star emoji font
+    font_star_emoji = find_font(star_emoji_font_paths, size_star_emoji)
     font_fc = find_font(font_paths, size_fc_text)
     font_rank = find_font(bold_font_paths, size_rank_text) # Try bold first
 
@@ -1305,7 +1316,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     vertical_spacing_title_diff = 10 # Smaller spacing between title and difficulty
     horizontal_spacing_rank_mods = 40 # Spacing between rank text and mods text
     horizontal_spacing_star_num = 5 # Small gap between number and star emoji
-    star_emoji_vertical_offset = 5 # Pixels to push emoji down relative to number's top
+    # star_emoji_vertical_offset removed - will calculate alignment based on heights
     rank_glow_radius = 6 # Increased glow radius for Rank neon effect
     fc_glow_radius = 7 # Increased glow radius for FC neon effect
 
@@ -1441,7 +1452,7 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     pp_text = f"{fetched_pp:.0f}PP" # Display the fetched PP
     pp_width, pp_height = get_text_dimensions(font_pp_stars, pp_text)
     star_number_text = stars_str # Use the potentially modded star rating string
-    star_emoji_text = "⭐"
+    star_emoji_text = "★" # Use BLACK STAR (U+2605) instead of emoji star
     star_number_width, star_number_height = get_text_dimensions(font_pp_stars, star_number_text)
     star_emoji_width, star_emoji_height = get_text_dimensions(font_star_emoji, star_emoji_text)
 
@@ -1465,13 +1476,14 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
 
     # Calculate position for star emoji
     star_emoji_x = stars_x + star_number_width + horizontal_spacing_star_num
-    # Align emoji top relative to number top + offset
-    star_emoji_y = stars_y + star_emoji_vertical_offset
+    # Align top of emoji with top of number, then adjust upwards slightly
+    star_emoji_vertical_adjust = -int(star_number_height * 0.8)
+    star_emoji_y = stars_y + star_emoji_vertical_adjust
 
     # Draw star emoji (using outline for consistency with other text)
     draw_text_with_effect(draw, (star_emoji_x, int(star_emoji_y)), star_emoji_text, font_star_emoji, star_color,
                           effect_type='outline', effect_color=outline_color, effect_radius=outline_width)
-    logger.info(f"Drew stars number at ({stars_x}, {stars_y}) and emoji at ({star_emoji_x}, {int(star_emoji_y)}) (using {star_emoji_vertical_offset}px vertical offset)")
+    logger.info(f"Drew stars number at ({stars_x}, {stars_y}) and emoji at ({star_emoji_x}, {int(star_emoji_y)}) (aligned top + {star_emoji_vertical_adjust}px adjustment)")
 
     # --- Draw FC Text if applicable (based on 0 misses AND PP/combo check) ---
     if is_true_fc: # Use the result of the PP comparison or combo fallback
@@ -1645,7 +1657,7 @@ class ThumbnailGeneratorGUI(QMainWindow):
         # --- Log Display Area ---
         self.log_display = QTextEdit()
         self.log_display.setReadOnly(True)
-        self.log_display.setLineWrapMode(QTextEdit.NoWrap) # Keep NoWrap for better readability
+        self.log_display.setLineWrapMode(QTextEdit.WidgetWidth) # Wrap lines at widget width
 
         # --- Add widgets to main layout ---
         layout.addWidget(self.credential_widget)
