@@ -1319,7 +1319,8 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None, force_fc: boo
     rank_text = rank[0] # Get the base letter (D, C, B, A, S, X)
     is_hidden_rank = rank.endswith('H') # Check if it's SH or XH
     # Determine if silver rank should be used based on API rank OR if rank is S/X and HD mod is present
-    use_silver = is_hidden_rank or (rank_text in ['S', 'X'] and Mods.Hidden in final_mods_enum)
+    # Cast final_mods_enum to Mods to allow the 'in' check
+    use_silver = is_hidden_rank or (rank_text in ['S', 'X'] and Mods.Hidden in Mods(final_mods_enum))
 
     if use_silver:
         rank_base_color = SILVER_BASE_COLOR
