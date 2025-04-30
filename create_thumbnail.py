@@ -13,7 +13,7 @@ import time
 import shutil
 import sys
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QLineEdit,
-                            QPushButton, QVBoxLayout, QWidget, QMessageBox,
+                            QPushButton, QVBoxLayout, QHBoxLayout, QWidget, QMessageBox,
                             QTextEdit)
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread
 from PyQt5.QtGui import QTextCursor
@@ -22,12 +22,6 @@ from enum import IntFlag
 import math # Import math for glow effect calculation
 from typing import Union, Tuple, Optional # Import Union, Tuple, Optional
 
-try:
-    import rosu_pp_py
-    ROSU_PP_AVAILABLE = True
-except ImportError:
-    ROSU_PP_AVAILABLE = False
-    # Log this issue later once logger is fully configured
 
 # --- Setup logging early ---
 LOG_FILENAME = 'thumbnail_generator.log' # Define log filename constant
@@ -38,10 +32,6 @@ log_file_handler.setFormatter(log_formatter)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG) # Set logger level
 logger.addHandler(log_file_handler)
-
-# Log rosu-pp status after logger setup
-if not ROSU_PP_AVAILABLE:
-    logger.warning("rosu-pp-py library not found. PP calculation for FC check will be skipped. Please install it using 'pip install rosu-pp-py'")
 
 
 # --- Custom Log Handler for PyQt GUI ---
@@ -62,18 +52,24 @@ class QtLogHandler(logging.Handler, QObject):
 class Worker(QObject):
     finished = pyqtSignal(bool, str) # Signal: success(bool), message(str)
 
-    def __init__(self, ordr_url, client_id, client_secret):
+    def __init__(self, ordr_url, client_id, client_secret, force_fc):
         super().__init__()
         self.ordr_url = ordr_url
         self.client_id = client_id
         self.client_secret = client_secret
+        self.force_fc = force_fc
 
     def run(self):
         """Runs the thumbnail creation task."""
-        logger.info("Worker thread run method started.")
+        logger.info(f"Worker thread run method started (force_fc={self.force_fc}).")
         try:
             logger.info("Calling create_thumbnail function...")
-            output_filename = create_thumbnail(self.ordr_url, self.client_id, self.client_secret)
+            output_filename = create_thumbnail(
+                self.ordr_url,
+                self.client_id,
+                self.client_secret,
+                force_fc=self.force_fc
+            )
             logger.info(f"create_thumbnail function finished successfully. Result: {output_filename}")
             logger.info("Emitting finished signal (success=True)...")
             self.finished.emit(True, f"Thumbnail created successfully as {output_filename}!")
@@ -702,87 +698,8 @@ def adjust_font_size(text, initial_size, font_paths, max_width, min_size=20, ste
     logger.warning(f"Text '{text[:30]}...' exceeded max width {max_width} even at min font size {min_size}. Using min size. Final width: {width}")
     return font, width, height
 
-# --- CORRECTED: PP Calculation Helper using rosu-pp-py ---
-def get_theoretical_pp(osu_file_content: Optional[str], mods_enum: int, accuracy: Optional[float] = None,
-                       count300: Optional[int] = None, count100: Optional[int] = None, count50: Optional[int] = None,
-                       miss_count: int = 0) -> Optional[float]:
-    """
-    Calculates theoretical PP for a map with given mods and accuracy/counts using rosu-pp-py.
-    Requires the content of the .osu file.
-    Provide EITHER accuracy (percentage float, e.g., 99.5) OR hit counts (count300, count100, count50).
-    Counts take precedence if provided. miss_count defaults to 0 for FC calculation.
-    Returns PP value as float or None if calculation fails or rosu-pp-py is unavailable.
-    """
-    if not ROSU_PP_AVAILABLE:
-        logger.warning("Cannot calculate theoretical PP: rosu-pp-py library not available.")
-        return None
 
-    if not osu_file_content:
-        logger.warning("Cannot calculate theoretical PP: .osu file content not provided.")
-        return None
-
-    calc_method = "Unknown" # For logging
-    calculator = None # Initialize calculator variable
-
-    try:
-        # Parse the beatmap content
-        logger.debug("Parsing .osu file content with rosu-pp-py...")
-        beatmap = rosu_pp_py.Beatmap(bytes=osu_file_content.encode('utf-8'))
-        logger.debug("Parsing successful.")
-
-        # Removed diagnostic logging
-
-        # Prepare parameters for the Performance constructor
-        calc_params = {
-            "mods": mods_enum,
-            "misses": miss_count # Corrected keyword from n_misses to misses
-        }
-        calc_method = "Unknown" # For logging
-
-        if count300 is not None and count100 is not None and count50 is not None:
-            calc_params["n300"] = count300
-            calc_params["n100"] = count100
-            calc_params["n50"] = count50
-            calc_method = f"Counts (300:{count300}, 100:{count100}, 50:{count50}, Miss:{miss_count})"
-        elif accuracy is not None:
-            # Clamp accuracy between 0 and 100
-            accuracy = max(0.0, min(100.0, accuracy))
-            calc_params["acc"] = accuracy
-            calc_method = f"Accuracy ({accuracy:.2f}%, Miss:{miss_count})"
-        else:
-            logger.warning("Cannot calculate theoretical PP: Neither accuracy nor hit counts provided.")
-            return None
-
-        logger.info(f"Requesting theoretical PP using rosu-pp-py Performance with {calc_method} and mods integer: {mods_enum}")
-
-        # Create a Performance instance with the parameters
-        performance = rosu_pp_py.Performance(**calc_params)
-
-        # Perform the calculation by passing the beatmap to the performance instance
-        pp_result = performance.calculate(beatmap)
-        pp_value = pp_result.pp
-
-        logger.info(f"Theoretical PP calculated via rosu-pp-py: {pp_value:.2f}")
-        return float(pp_value)
-
-    # Removed misplaced except UnicodeDecodeError block that caused F821
-
-    except UnicodeDecodeError as e:
-        logger.error(f"Failed to decode .osu file content (likely invalid encoding): {e}")
-        return None
-    except AttributeError as e:
-        # Catch specific AttributeError if Calculate or other methods are missing
-        logger.error(f"Error during rosu-pp-py usage (AttributeError): {e}", exc_info=True)
-        logger.error("This might indicate an incompatible version of rosu-pp-py or incorrect usage.")
-        return None
-    except Exception as e:
-        # Catch other potential errors during parsing or calculation within rosu-pp-py
-        logger.error(f"Error during rosu-pp-py calculation: {e}", exc_info=True)
-        return None
-# --- END CORRECTED PP Calculation Helper ---
-
-
-def create_thumbnail(ordr_url, client_id=None, client_secret=None):
+def create_thumbnail(ordr_url, client_id=None, client_secret=None, force_fc: bool = False):
     """Create osu! thumbnail from ORDR render link.
        Returns the filename of the created thumbnail.
     """
@@ -842,7 +759,6 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
     beatmap_max_combo = None # Store max combo for the specific beatmap difficulty
     mods_source = "ORDR Enum" # Track where the final mods came from
     rank = 'D' # Default rank
-    is_true_fc = False # Default "True FC" status (0 misses AND 0 slider breaks, verified by PP check or combo check)
     is_global_first = False # Default global #1 status
     api_mods_list = None # Store mods list from API score if available
     osu_file_content = None # Store content of the .osu file
@@ -1237,68 +1153,6 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
                         mods_source = "osu! API Score (NM)"
                         final_mods_enum = Mods.NoMod # Ensure enum is also NM
 
-                    # --- Determine "True FC" status ---
-                    # Requires miss_count, hit counts, final_mods_enum, osu_file_content, score_max_combo, beatmap_max_combo
-                    if miss_count == 0:
-                        logger.info("Miss count is 0. Prioritizing combo check for FC status.")
-                        # 1. Check combo first
-                        if beatmap_max_combo is not None and score_max_combo >= beatmap_max_combo:
-                            is_true_fc = True
-                            logger.info(f"Determined True FC: Yes (Combo Check: Score Combo={score_max_combo}, Map Combo={beatmap_max_combo})")
-                        else:
-                            # Combo check failed or not possible, proceed to PP check
-                            reason = []
-                            if beatmap_max_combo is None: reason.append("Map Max Combo unknown")
-                            elif score_max_combo < beatmap_max_combo: reason.append(f"Score Combo={score_max_combo} < Map Combo={beatmap_max_combo}")
-                            logger.info(f"Combo check inconclusive ({', '.join(reason)}). Attempting PP comparison for FC check using rosu-pp-py.")
-
-                            # 2. Try calculating theoretical PP for an FC with this accuracy/mods using exact hit counts
-                            logger.info("Calling get_theoretical_pp for FC check...")
-                            theoretical_pp = get_theoretical_pp(
-                                osu_file_content=osu_file_content, # Use the fetched content
-                                mods_enum=final_mods_enum, # Use the final mods
-                                count300=count_300,
-                                count100=count_100,
-                                count50=count_50,
-                                miss_count=0 # Explicitly set 0 misses for FC calc
-                            )
-
-                            if theoretical_pp is not None:
-                                # Compare fetched PP with theoretical PP (allow 15% relative difference)
-                                pp_relative_tolerance = 0.05 # 5%
-                                difference = abs(fetched_pp - theoretical_pp)
-                                # Handle theoretical_pp being zero or very small
-                                if theoretical_pp > 1e-6: # Avoid division by zero/large relative error for tiny PP values
-                                    is_match = (difference / theoretical_pp) <= pp_relative_tolerance
-                                else:
-                                    # If theoretical PP is essentially zero, fetched PP must also be essentially zero
-                                    is_match = difference <= 1e-6 # Use a very small absolute tolerance for zero case
-
-                                if is_match:
-                                    is_true_fc = True
-                                    logger.info(f"Determined True FC: Yes (PP Match: Fetched={fetched_pp:.2f}, Theoretical={theoretical_pp:.2f}, Relative Difference <= {pp_relative_tolerance*100:.0f}%)")
-                                else:
-                                    is_true_fc = False
-                                    relative_diff_str = f"{(difference / theoretical_pp * 100):.1f}%" if theoretical_pp > 1e-6 else "N/A (Theoretical PP is zero)"
-                                    logger.info(f"Determined True FC: No (PP Mismatch: Fetched={fetched_pp:.2f}, Theoretical={theoretical_pp:.2f}, Relative Difference={relative_diff_str} > {pp_relative_tolerance*100:.0f}%) - Likely slider break.")
-                            else:
-                                # PP calculation failed or skipped, and combo check already failed/inconclusive
-                                is_true_fc = False
-                                logger.warning("Theoretical PP calculation failed or skipped, and combo check was inconclusive. Determined True FC: No.")
-
-                    elif miss_count > 0:
-                        # Not an FC if misses > 0
-                        is_true_fc = False
-                        logger.info(f"Determined True FC: No (Miss Count={miss_count})")
-                    else: # miss_count is -1 (unknown)
-                        is_true_fc = False
-                        logger.info(f"Determined True FC: No (Miss Count unknown from API)")
-
-
-                    # Log the API 'perfect' flag for comparison/debugging
-                    api_perfect_flag = score_info.get("perfect", False)
-                    logger.info(f"API 'perfect' flag value (for info only): {api_perfect_flag}")
-
                     # --- Check if this score is Global #1 ---
                     logger.info(f"Checking global leaderboard for beatmap {beatmap_id}...")
                     try:
@@ -1318,10 +1172,9 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
                         logger.error(f"Failed to fetch or process global leaderboard: {global_e}")
 
                 else: # This else corresponds to 'if score_info:'
-                    logger.warning(f"Score not found via API for user {user_id} on beatmap {beatmap_id}. PP set to 0. Rank set to D. True FC status unknown. Global #1 status unknown. Using mods from ORDR enum ('{mods_str}', enum {final_mods_enum}).")
+                    logger.warning(f"Score not found via API for user {user_id} on beatmap {beatmap_id}. PP set to 0. Rank set to D. Global #1 status unknown. Using mods from ORDR enum ('{mods_str}', enum {final_mods_enum}).")
                     fetched_pp = 0.0 # Reset PP if score not found
                     rank = 'D'
-                    is_true_fc = False # Assume not True FC if score not found
                     # Keep mods_str and final_mods_enum from ORDR
 
                 # --- Fetch Modded Star Rating ---
@@ -1351,23 +1204,21 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
                 # Keep mods_str, final_mods_enum, stars, stars_str from earlier steps
 
         except Exception as e:
-            logger.error(f"Could not fetch PP/Score/Rank/FC/Stars details: {e}", exc_info=True)
-            logger.warning(f"Proceeding with default PP (0.0), Rank (D), True FC (False), mods from ORDR enum ('{mods_str}'), and stars from '{stars_source}' ({stars_str}).")
+            logger.error(f"Could not fetch PP/Score/Rank/Stars details: {e}", exc_info=True)
+            logger.warning(f"Proceeding with default PP (0.0), Rank (D), mods from ORDR enum ('{mods_str}'), and stars from '{stars_source}' ({stars_str}).")
             fetched_pp = 0.0 # Reset PP on error
             rank = 'D' # Default rank on error
-            is_true_fc = False # Default True FC on error
             # Keep mods_str, final_mods_enum, stars, stars_str from earlier steps
 
     else: # No API credentials provided or initial API fetch failed
-         logger.info(f"No API credentials or data available. Using default PP (0.0), Rank (D), True FC (False), mods from ORDR enum ('{mods_str}'), and stars from '{stars_source}' ({stars_str}).")
+         logger.info(f"No API credentials or data available. Using default PP (0.0), Rank (D), mods from ORDR enum ('{mods_str}'), and stars from '{stars_source}' ({stars_str}).")
          fetched_pp = 0.0 # Default PP
          rank = 'D' # Default rank
-         is_true_fc = False # Default True FC
          # Keep mods_str, final_mods_enum, stars, stars_str from earlier steps
     logger.info("Finished fetching/determining score/rank/mods/stars.")
     time.sleep(0.01) # Yield time
 
-    logger.info(f"Final values - PP: {fetched_pp:.2f}, Mods: {mods_str} (Source: {mods_source}, Enum: {final_mods_enum}), Rank: {rank}, True FC: {is_true_fc}, Global #1: {is_global_first}, Stars: {stars_str} (Source: {stars_source})")
+    logger.info(f"Final values - PP: {fetched_pp:.2f}, Mods: {mods_str} (Source: {mods_source}, Enum: {final_mods_enum}), Rank: {rank}, Force FC: {force_fc}, Global #1: {is_global_first}, Stars: {stars_str} (Source: {stars_source})")
 
     # --- Text Drawing ---
     logger.info("Starting text drawing phase...")
@@ -1580,10 +1431,10 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
         logger.info("Skipping #1 indicator because score is not global first.")
 
 
-    # --- Draw FC Text if applicable (based on 0 misses AND PP/combo check) ---
-    logger.info("Checking if FC text should be drawn...")
-    if is_true_fc: # Use the result of the PP comparison or combo fallback
-        logger.info("Drawing FC text...")
+    # --- Draw FC Text if force_fc is True ---
+    logger.info("Checking if FC text should be drawn (based on force_fc parameter)...")
+    if force_fc:
+        logger.info("Drawing FC text (force_fc=True)...")
         fc_text = "FC"
         fc_pos_x = 50 # Left margin
         fc_pos_y = 30 # Top margin
@@ -1593,9 +1444,9 @@ def create_thumbnail(ordr_url, client_id=None, client_secret=None):
                               effect_type='glow',
                               effect_color=FC_GLOW_COLOR, # Glow color (Bright Yellow)
                               effect_radius=fc_glow_radius) # Use defined FC glow radius
-        logger.info(f"Drew FC text with neon glow at ({fc_pos_x}, {fc_pos_y}) because True FC conditions were met.")
+        logger.info(f"Drew FC text with neon glow at ({fc_pos_x}, {fc_pos_y}).")
     else:
-        logger.info("Skipping FC text because True FC conditions were not met (misses > 0 or PP/combo check failed).")
+        logger.info("Skipping FC text (force_fc=False).")
 
 
     logger.info("Text drawing phase finished.")
@@ -1756,9 +1607,22 @@ class ThumbnailGeneratorGUI(QMainWindow):
         ordr_layout.addWidget(QLabel("ORDR URL:"))
         ordr_layout.addWidget(self.ordr_url_input)
 
-        # --- Action Button (Common to both phases) ---
-        self.action_button = QPushButton("Verify Credentials")
-        self.action_button.clicked.connect(self.handle_action_button)
+        # --- Action Buttons ---
+        self.verify_button = QPushButton("Verify Credentials")
+        self.verify_button.clicked.connect(self.handle_verify_button)
+
+        # Layout for Generate buttons
+        self.generate_buttons_widget = QWidget()
+        generate_buttons_layout = QHBoxLayout(self.generate_buttons_widget)
+        generate_buttons_layout.setContentsMargins(0, 0, 0, 0) # Remove margins for the horizontal layout
+
+        self.generate_score_button = QPushButton("Generate Thumbnail (Score)")
+        self.generate_score_button.clicked.connect(self.handle_generate_button)
+        self.generate_fc_button = QPushButton("Generate Thumbnail (FC)")
+        self.generate_fc_button.clicked.connect(self.handle_generate_button)
+
+        generate_buttons_layout.addWidget(self.generate_score_button)
+        generate_buttons_layout.addWidget(self.generate_fc_button)
 
         # --- Log Display Area ---
         self.log_display = QTextEdit()
@@ -1768,7 +1632,8 @@ class ThumbnailGeneratorGUI(QMainWindow):
         # --- Add widgets to main layout ---
         layout.addWidget(self.credential_widget)
         layout.addWidget(self.ordr_widget)
-        layout.addWidget(self.action_button)
+        layout.addWidget(self.verify_button) # Add verify button first
+        layout.addWidget(self.generate_buttons_widget) # Add generate buttons layout
         layout.addWidget(QLabel("Log Output:"))
         layout.addWidget(self.log_display)
 
@@ -1781,6 +1646,7 @@ class ThumbnailGeneratorGUI(QMainWindow):
 
         # --- Initial State ---
         self.ordr_widget.hide()
+        self.generate_buttons_widget.hide() # Hide generate buttons initially
         self.logger.info("GUI Initialized. Showing credential input.")
 
         # --- Attempt Auto-Verification ---
@@ -1795,11 +1661,12 @@ class ThumbnailGeneratorGUI(QMainWindow):
                 # QMessageBox.warning(self, "Auto-Verification Failed", "Could not verify saved credentials. Please check them.")
 
     def _switch_to_ordr_view(self):
-        """Hides credential input and shows ORDR input."""
+        """Hides credential input/verify button and shows ORDR input/generate buttons."""
         self.credential_widget.hide()
+        self.verify_button.hide() # Hide verify button
         self.ordr_widget.show()
-        self.action_button.setText("Generate Thumbnail")
-        self.logger.info("Switched view to ORDR input.")
+        self.generate_buttons_widget.show() # Show generate buttons
+        self.logger.info("Switched view to ORDR input and Generate buttons.")
 
     def update_log_display(self, log_entry):
         """Appends a log message to the QTextEdit and ensures it's visible. This runs in the main GUI thread."""
@@ -1812,96 +1679,124 @@ class ThumbnailGeneratorGUI(QMainWindow):
         # self.log_display.verticalScrollBar().setValue(self.log_display.verticalScrollBar().maximum())
 
 
-    def handle_action_button(self):
-        """Handles clicks for the main button, switching between verify and generate."""
+    def handle_verify_button(self):
+        """Handles clicks for the Verify Credentials button."""
         try:
-            if self.ordr_widget.isHidden():
-                # --- Verification Phase (Runs synchronously, usually fast) ---
-                self.logger.info("Verify button clicked.")
-                client_id = self.client_id_input.text().strip()
-                client_secret = self.client_secret_input.text().strip()
+            # --- Verification Phase (Runs synchronously, usually fast) ---
+            self.logger.info("Verify button clicked.")
+            client_id = self.client_id_input.text().strip()
+            client_secret = self.client_secret_input.text().strip()
 
-                if not client_id or not client_secret:
-                    self.logger.warning("Verification failed: Client ID or Secret missing.")
-                    QMessageBox.warning(self, "Input Required", "Both Client ID and Client Secret are required.")
-                    return
+            if not client_id or not client_secret:
+                self.logger.warning("Verification failed: Client ID or Secret missing.")
+                QMessageBox.warning(self, "Input Required", "Both Client ID and Client Secret are required.")
+                return
 
-                self.action_button.setEnabled(False)
-                self.action_button.setText("Verifying...")
-                QApplication.processEvents() # Update button text
+            self.verify_button.setEnabled(False)
+            self.verify_button.setText("Verifying...")
+            QApplication.processEvents() # Update button text
 
-                if verify_credentials(client_id, client_secret):
-                    self.logger.info("Credentials verified successfully.")
-                    if save_credentials_to_env(client_id, client_secret):
-                         self.logger.info("Credentials saved to environment.")
-                         # QMessageBox.information(self, "Success", "Credentials verified and saved successfully!")
-                    else:
-                         self.logger.error("Failed to save credentials after verification.")
-                         QMessageBox.warning(self, "Warning", "Credentials verified, but failed to save them to environment variables. Check log for details (may require admin rights).")
-
-                    self._switch_to_ordr_view()
+            if verify_credentials(client_id, client_secret):
+                self.logger.info("Credentials verified successfully.")
+                if save_credentials_to_env(client_id, client_secret):
+                        self.logger.info("Credentials saved to environment.")
+                        # QMessageBox.information(self, "Success", "Credentials verified and saved successfully!")
                 else:
-                    self.logger.warning("Verification failed: Invalid credentials.")
-                    QMessageBox.warning(self, "Verification Failed", "Invalid API credentials. Please check and try again.")
-                    self.action_button.setText("Verify Credentials") # Reset button text on failure
+                        self.logger.error("Failed to save credentials after verification.")
+                        QMessageBox.warning(self, "Warning", "Credentials verified, but failed to save them to environment variables. Check log for details (may require admin rights).")
 
-                # Re-enable button
-                self.action_button.setEnabled(True)
-
+                self._switch_to_ordr_view()
             else:
-                # --- Generation Phase (Run in worker thread) ---
-                self.logger.info("Generate Thumbnail button clicked.")
-                ordr_url = self.ordr_url_input.text().strip()
+                self.logger.warning("Verification failed: Invalid credentials.")
+                QMessageBox.warning(self, "Verification Failed", "Invalid API credentials. Please check and try again.")
+                self.verify_button.setText("Verify Credentials") # Reset button text on failure
 
-                if not ordr_url:
-                    self.logger.warning("Generation failed: ORDR URL missing.")
-                    QMessageBox.warning(self, "Input Required", "ORDR URL is required.")
-                    return
-
-                # Disable button and update text *before* starting thread
-                self.action_button.setEnabled(False)
-                self.action_button.setText("Generating...")
-                QApplication.processEvents() # Ensure button updates before potential blocking
-
-                client_id = self.client_id_input.text().strip()
-                client_secret = self.client_secret_input.text().strip()
-
-                # --- Setup and start worker thread ---
-                # Ensure previous thread is cleaned up if user clicks rapidly (shouldn't happen with button disabled)
-                if self.thread is not None and self.thread.isRunning():
-                    logger.warning("Previous worker thread still running? Attempting to wait...")
-                    self.thread.quit()
-                    self.thread.wait(1000) # Wait a bit
-
-                self.thread = QThread()
-                self.worker = Worker(ordr_url, client_id, client_secret)
-                self.worker.moveToThread(self.thread)
-
-                # Connections
-                self.worker.finished.connect(self.on_generation_complete)
-                self.thread.started.connect(self.worker.run)
-                # Cleanup connections
-                self.worker.finished.connect(self.thread.quit)
-                self.worker.finished.connect(self.worker.deleteLater)
-                self.thread.finished.connect(self.thread.deleteLater)
-                # Ensure thread object is cleared after it finishes
-                self.thread.finished.connect(self._clear_thread_ref)
-
-                self.logger.info("Starting worker thread...")
-                self.thread.start()
-                self.logger.info("Worker thread start command issued.")
+            # Re-enable button
+            self.verify_button.setEnabled(True)
 
         except Exception as e:
             # Catch-all for unexpected errors in the handler logic itself
-            self.logger.exception("Unexpected error in GUI action handler:")
-            QMessageBox.critical(self, "GUI Error", f"An unexpected error occurred in the application:\n{str(e)}\n\nCheck the log window and thumbnail_generator.log for details.")
+            self.logger.exception("Unexpected error in GUI verify handler:")
+            QMessageBox.critical(self, "GUI Error", f"An unexpected error occurred during verification:\n{str(e)}\n\nCheck the log window and thumbnail_generator.log for details.")
+            # Reset button state on error
+            self.verify_button.setEnabled(True)
+            self.verify_button.setText("Verify Credentials")
+            # Clear thread refs if an error occurred during setup (unlikely here, but good practice)
+            self.thread = None
+            self.worker = None
+
+    def handle_generate_button(self):
+        """Handles clicks for the Generate Thumbnail buttons."""
+        try:
+            sender = self.sender() # Get the button that was clicked
+            if sender == self.generate_score_button:
+                force_fc = False
+                button_text = "Generate Thumbnail (Score)"
+                self.logger.info("Generate Thumbnail (Score) button clicked.")
+            elif sender == self.generate_fc_button:
+                force_fc = True
+                button_text = "Generate Thumbnail (FC)"
+                self.logger.info("Generate Thumbnail (FC) button clicked.")
+            else:
+                self.logger.warning("Unknown sender for generate button click.")
+                return # Should not happen
+
+            ordr_url = self.ordr_url_input.text().strip()
+
+            if not ordr_url:
+                self.logger.warning("Generation failed: ORDR URL missing.")
+                QMessageBox.warning(self, "Input Required", "ORDR URL is required.")
+                return
+
+            # Disable *both* generate buttons and update text *before* starting thread
+            self.generate_score_button.setEnabled(False)
+            self.generate_fc_button.setEnabled(False)
+            sender.setText("Generating...") # Set text on the clicked button
+            QApplication.processEvents() # Ensure button updates before potential blocking
+
+            client_id = self.client_id_input.text().strip()
+            client_secret = self.client_secret_input.text().strip()
+
+            # --- Setup and start worker thread ---
+            if self.thread is not None and self.thread.isRunning():
+                logger.warning("Previous worker thread still running? Attempting to wait...")
+                self.thread.quit()
+                if not self.thread.wait(1000): # Wait a bit
+                    logger.warning("Thread did not quit gracefully, terminating.")
+                    self.thread.terminate()
+                    self.thread.wait() # Wait for termination
+                self.thread = None # Clear ref after stopping
+                self.worker = None
+
+            self.thread = QThread()
+            # Pass force_fc to the Worker
+            self.worker = Worker(ordr_url, client_id, client_secret, force_fc)
+            self.worker.moveToThread(self.thread)
+
+            # Connections
+            self.worker.finished.connect(self.on_generation_complete)
+            self.thread.started.connect(self.worker.run)
+            # Cleanup connections
+            self.worker.finished.connect(self.thread.quit)
+            self.worker.finished.connect(self.worker.deleteLater)
+            self.thread.finished.connect(self.thread.deleteLater)
+            # Ensure thread object is cleared after it finishes
+            self.thread.finished.connect(self._clear_thread_ref)
+
+            self.logger.info(f"Starting worker thread (force_fc={force_fc})...")
+            self.thread.start()
+            self.logger.info("Worker thread start command issued.")
+
+        except Exception as e:
+            # Catch-all for unexpected errors in the handler logic itself
+            self.logger.exception("Unexpected error in GUI generate handler:")
+            QMessageBox.critical(self, "GUI Error", f"An unexpected error occurred during generation setup:\n{str(e)}\n\nCheck the log window and thumbnail_generator.log for details.")
 
             # Reset button state on error
-            self.action_button.setEnabled(True)
-            if self.ordr_widget.isHidden():
-                self.action_button.setText("Verify Credentials")
-            else:
-                self.action_button.setText("Generate Thumbnail")
+            self.generate_score_button.setEnabled(True)
+            self.generate_fc_button.setEnabled(True)
+            self.generate_score_button.setText("Generate Thumbnail (Score)")
+            self.generate_fc_button.setText("Generate Thumbnail (FC)")
             # Clear thread refs if an error occurred during setup
             self.thread = None
             self.worker = None
@@ -1916,8 +1811,12 @@ class ThumbnailGeneratorGUI(QMainWindow):
         """Slot executed in the main GUI thread when the worker finishes."""
         self.logger.info("--- on_generation_complete slot entered ---")
         self.logger.info(f"Generation complete signal received. Success: {success}, Message: {message}")
-        self.action_button.setEnabled(True) # Re-enable button
-        self.action_button.setText("Generate Thumbnail") # Reset button text
+
+        # Re-enable and reset text for *both* generate buttons
+        self.generate_score_button.setEnabled(True)
+        self.generate_fc_button.setEnabled(True)
+        self.generate_score_button.setText("Generate Thumbnail (Score)")
+        self.generate_fc_button.setText("Generate Thumbnail (FC)")
 
         if success:
             QMessageBox.information(self, "Success", message)
